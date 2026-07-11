@@ -29,7 +29,16 @@ First runtime. Everything before this release was documentation (Phase 0).
   `/generate` with positive re-verification, absent ⇒ most restrictive tier assumed; **CA-3** —
   `/generate` returns `run_id` in the response body and an `X-Run-Id` header, closing the
   cancel-without-an-id ambiguity.
-* Test suite (64 tests): privacy property tests, placement policy, all six routes over real HTTP,
+* **503 for known-but-unhealthy models** on `/v1/chat/completions`: the provider registry retains
+  each provider's last *healthy* model inventory, so a model whose provider is temporarily down
+  answers `503` (`error.code = "model_temporarily_unavailable"`) instead of `404` — an OpenAI
+  client can distinguish temporarily-down from never-existed. Privacy-filtered providers are
+  ignored by the check, so it leaks nothing the caller's tier forbids. Best-effort and
+  process-local (in-memory; documented in docs/CONTRACT.md Layer 2).
+* `NOTICE` file (Apache-2.0 attribution) and PEP 639 license metadata (`license = "Apache-2.0"`,
+  `license-files = ["LICENSE"]`, setuptools>=77), matching the other Connect repos.
+* Test suite (66 tests): privacy property tests, placement policy, all six routes over real HTTP,
   streaming/cancellation/disconnect propagation, OpenAI layer, fault injection (upstream down,
-  mid-stream engine failure), conformance via AgentConnect's shipped `HttpLocalComputeProvider`,
-  and real-engine tests against llama.cpp on `:8080` that skip when it is unreachable.
+  mid-stream engine failure, dead-provider 503 vs 404 vs privacy-clamped 404), conformance via
+  AgentConnect's shipped `HttpLocalComputeProvider`, and real-engine tests against llama.cpp on
+  `:8080` that skip when it is unreachable.

@@ -74,6 +74,66 @@ def test_openai_layer_upstream_down_is_clean_error(stack_upstream_down):
     assert "error" in resp.json()
 
 
+def test_openai_known_but_unhealthy_model_is_503(stack, upstream_server):
+    """A model seen in a provider's last healthy inventory answers 503, not
+    404, while that provider is down — an OpenAI client can distinguish
+    temporarily-down from never-existed."""
+    _, upstream_handle = upstream_server
+    # Learn the inventory while the upstream is healthy.
+    body = httpx.get(f"{stack.base_url}/models", timeout=15).json()
+    assert "fake-llama-7b" in {m["id"] for m in body["models"]}
+    # Kill the upstream engine.
+    upstream_handle.stop()
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        json={"model": "fake-llama-7b", "messages": [{"role": "user", "content": "x"}]},
+        timeout=15,
+    )
+    assert resp.status_code == 503
+    err = resp.json()["error"]
+    assert err["code"] == "model_temporarily_unavailable"
+    assert err["type"] == "service_unavailable"
+    # A model that never existed anywhere is still a plain 404.
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        json={"model": "never-existed", "messages": [{"role": "user", "content": "x"}]},
+        timeout=15,
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "model_not_found"
+
+
+def test_openai_dead_cloud_model_not_leaked_under_restrictive_tier(stack):
+    """The 503 distinction must not leak models the effective privacy tier
+    forbids: a cloud-only model stays 404 under the default (most
+    restrictive) tier even though the registry remembers it."""
+    # Learn the inventory (sim-cloud healthy), then take the cloud down.
+    httpx.get(f"{stack.base_url}/models", timeout=15)
+    stack.sim.fail_health = True
+    try:
+        resp = httpx.post(
+            f"{stack.base_url}/v1/chat/completions",
+            json={"model": "sim-cloud-large", "messages": [{"role": "user", "content": "x"}]},
+            timeout=15,
+        )
+        assert resp.status_code == 404
+        assert resp.json()["error"]["code"] == "model_not_found"
+        # With an explicitly cloud-permitting tier, the same model is 503.
+        resp = httpx.post(
+            f"{stack.base_url}/v1/chat/completions",
+            json={
+                "model": "sim-cloud-large",
+                "messages": [{"role": "user", "content": "x"}],
+                "privacy_tier": "public",
+            },
+            timeout=15,
+        )
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "model_temporarily_unavailable"
+    finally:
+        stack.sim.fail_health = False
+
+
 def test_estimate_never_500s_on_malformed_body(stack):
     resp = httpx.post(
         f"{stack.base_url}/route/estimate",

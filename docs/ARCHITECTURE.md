@@ -501,7 +501,9 @@ before either side implements. Changing this surface unilaterally is not in scop
 
 ### 7.2 BrainConnect — a compute consumer, not a peer
 
-BrainConnect is WikiBrain, renamed; the rename is in progress and the code still says `wiki`.
+BrainConnect is WikiBrain, renamed; the rename is complete — the package and CLI are
+`brainconnect`, the service identifies itself as `brainconnect`, and `brainconnect serve` exposes
+the memory link on `127.0.0.1:8787`.
 
 BrainConnect's librarian is model-bearing: `cli/librarian/client.py` targets a configurable
 OpenAI-compatible `base_url` (defaulting to Ollama's `:11434`). On this host, the endpoint it is

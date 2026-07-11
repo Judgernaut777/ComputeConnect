@@ -125,6 +125,6 @@ full placement rationale and rejection list.
 
 * `Connect/README.md` still lists ComputeConnect as design-phase/scope-undefined; as of v0.1.0
   there is a runtime. Owned by the Connect repo.
-* The BrainConnect rename remains in progress; its librarian still targets an OpenAI-compatible
-  `base_url` and can point at `:8090/v1` unchanged — but nothing has been rewired, and `:8787`
-  remains reserved for BrainConnect's own serve.
+* The BrainConnect rename is complete (package/CLI `brainconnect`, service string `brainconnect`,
+  `brainconnect serve` on `:8787`); its librarian still targets an OpenAI-compatible `base_url`
+  and can point at `:8090/v1` unchanged — but nothing has been rewired.
