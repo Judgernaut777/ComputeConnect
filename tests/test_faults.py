@@ -1,0 +1,89 @@
+"""Fault behavior: an outage is a refusal, never a crash (binding invariant 2)."""
+
+from __future__ import annotations
+
+import httpx
+
+
+def test_upstream_down_health_is_degraded_not_error(stack_upstream_down):
+    stack = stack_upstream_down
+    resp = httpx.get(f"{stack.base_url}/health", timeout=15)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "degraded"  # sim cloud still up
+    assert body["providers"]["local-llamacpp"]["healthy"] is False
+    assert "unreachable" in body["providers"]["local-llamacpp"]["detail"]
+
+
+def test_upstream_down_models_omits_dead_provider(stack_upstream_down):
+    body = httpx.get(f"{stack_upstream_down.base_url}/models", timeout=15).json()
+    assert {m["id"] for m in body["models"]} == {"sim-cloud-large"}
+
+
+def test_upstream_down_estimate_refuses_with_reason(stack_upstream_down):
+    resp = httpx.post(
+        f"{stack_upstream_down.base_url}/route/estimate",
+        json={"task_type": "general", "privacy_tier": "local_only"},
+        timeout=15,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["eligible"] is False
+    assert body["reason"]["code"] == "no_compliant_provider"
+    stages = {r["stage"] for r in body["reason"]["rejected"]}
+    assert stages == {"privacy", "health"}  # cloud filtered, local dead
+
+
+def test_upstream_down_generate_is_refusal_not_500(stack_upstream_down):
+    resp = httpx.post(
+        f"{stack_upstream_down.base_url}/generate",
+        json={"task_type": "general", "prompt": "hi"},
+        timeout=15,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "refused"
+    assert body["refusal"]["code"] == "no_compliant_provider"
+    # Service is still alive.
+    assert httpx.get(f"{stack_upstream_down.base_url}/health", timeout=15).status_code == 200
+
+
+def test_all_providers_down_health_is_down(stack_upstream_down):
+    stack = stack_upstream_down
+    stack.sim.fail_health = True
+    try:
+        body = httpx.get(f"{stack.base_url}/health", timeout=15).json()
+        assert body["status"] == "down"
+        est = httpx.post(
+            f"{stack.base_url}/route/estimate",
+            json={"task_type": "general", "privacy_tier": "public"},
+            timeout=15,
+        ).json()
+        assert est["eligible"] is False
+    finally:
+        stack.sim.fail_health = False
+
+
+def test_openai_layer_upstream_down_is_clean_error(stack_upstream_down):
+    resp = httpx.post(
+        f"{stack_upstream_down.base_url}/v1/chat/completions",
+        json={"model": "fake-llama-7b", "messages": [{"role": "user", "content": "x"}]},
+        timeout=15,
+    )
+    assert resp.status_code == 404  # model not visible while its provider is dead
+    assert "error" in resp.json()
+
+
+def test_estimate_never_500s_on_malformed_body(stack):
+    resp = httpx.post(
+        f"{stack.base_url}/route/estimate",
+        content=b"this is not json",
+        headers={"content-type": "application/json"},
+        timeout=10,
+    )
+    assert resp.status_code == 400
+
+
+def test_generate_requires_prompt(stack):
+    resp = httpx.post(f"{stack.base_url}/generate", json={"task_type": "general"}, timeout=10)
+    assert resp.status_code == 400
