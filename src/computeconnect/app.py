@@ -422,6 +422,19 @@ class ComputeConnectAPI:
                     403,
                     code=outcome.code,
                 )
+            # Known-but-unhealthy beats never-existed: if the model was in a
+            # provider's last healthy inventory and that provider is down,
+            # an OpenAI client should see "retry later", not "no such model".
+            if self.registry.known_but_unhealthy(
+                str(model_name), cloud_permitted=candidates.privacy.cloud_permitted
+            ):
+                return self._openai_error(
+                    f"model '{model_name}' is known but its provider is currently "
+                    f"unhealthy; retry later: {json.dumps(outcome.to_dict())}",
+                    "service_unavailable",
+                    503,
+                    code="model_temporarily_unavailable",
+                )
             return self._openai_error(
                 f"model '{model_name}' not found: {json.dumps(outcome.to_dict())}",
                 "invalid_request_error",

@@ -56,6 +56,23 @@ the `X-Privacy-Tier` request header (or a `privacy_tier` body extension); an imp
 yields a structured `403` refusal (`error.type = "privacy_refusal"`), never a silent downgrade.
 Responses carry an `X-Run-Id` header usable with `POST /runs/{run_id}/cancel`.
 
+Model-resolution errors distinguish three cases so an OpenAI client can react correctly:
+
+* **`404` `model_not_found`** — no provider is currently serving the model *and* it was not in the
+  last healthy inventory of any (privacy-permitted) provider that is currently down.
+* **`503` `model_temporarily_unavailable`** (`error.type = "service_unavailable"`) — the model was
+  present in a provider's last *healthy* inventory and that provider is currently unhealthy:
+  temporarily-down, not never-existed. Retry later. Providers the effective privacy tier filters
+  out are ignored here, so this signal cannot leak the existence of a model the caller could never
+  use.
+* **`403` `privacy_refusal`** — the model exists on a healthy provider but the effective tier
+  forbids that provider.
+
+**Known limitation:** the 503 distinction is best-effort and process-local. The last-healthy
+inventory lives in memory; after a ComputeConnect restart while the provider is still down, a
+genuinely-known model answers `404` until its provider is next seen healthy. Persisting inventory
+across restarts is out of scope for v0.1.0.
+
 ---
 
 ## Binding invariants

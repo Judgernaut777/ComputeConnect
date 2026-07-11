@@ -53,6 +53,10 @@ class _CacheEntry:
     healthy: bool = False
     detail: str = "never probed"
     models: tuple[ModelInfo, ...] = ()
+    #: Inventory from the last *healthy* probe. Retained across outages so the
+    #: OpenAI layer can answer 503 (known but temporarily unavailable) instead
+    #: of 404 (never existed) for models whose provider is currently down.
+    last_known_models: tuple[ModelInfo, ...] = ()
 
 
 class ProviderRegistry:
@@ -91,6 +95,7 @@ class ProviderRegistry:
                 models = await spec.engine.list_models()
                 entry.healthy, entry.detail = True, status
                 entry.models = tuple(models)
+                entry.last_known_models = entry.models
         except Exception as exc:  # an outage is a refusal, not an exception
             entry.healthy, entry.detail, entry.models = False, f"unreachable: {exc}", ()
         entry.taken_at = time.time()
@@ -115,6 +120,28 @@ class ProviderRegistry:
                 )
             )
         return tuple(out)
+
+    def known_but_unhealthy(self, model_id: str, *, cloud_permitted: bool) -> bool:
+        """True when ``model_id`` was in the last *healthy* inventory of a
+        provider that is currently unhealthy.
+
+        Distinguishes "temporarily down" from "never existed" using only
+        retained cache state — no probe. Cloud providers are skipped unless
+        ``cloud_permitted``, so this can never leak the existence of a model
+        the caller's effective privacy tier forbids anyway. Reads the cache
+        as-is: call after ``snapshot()`` for a fresh view. Best-effort and
+        process-local — after a restart with the provider still down there is
+        no last-healthy inventory and the answer is False.
+        """
+        for spec in self._providers:
+            if spec.placement_class == "cloud" and not cloud_permitted:
+                continue
+            entry = self._cache[spec.id]
+            if entry.healthy:
+                continue
+            if any(m.id == model_id for m in entry.last_known_models):
+                return True
+        return False
 
     def invalidate(self) -> None:
         """Force the next snapshot to re-probe every provider."""
