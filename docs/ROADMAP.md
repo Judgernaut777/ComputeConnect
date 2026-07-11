@@ -1,5 +1,26 @@
 # Roadmap
 
+**Progress as of v0.1.0 (2026-07-12):**
+
+* **Phase 0 — met** (unchanged).
+* **Phase 1 — gate met**: AgentConnect's shipped `HttpLocalComputeProvider` called
+  `/health`, `/models`, `/models/loaded` against a live ComputeConnect backed by the real
+  llama.cpp service and got back `qwen3-30b-a3b` (`tests/test_real_engine.py`). The capability
+  *normalizer* was **not** built — capabilities are operator-declared tags; the `lscpu`/NVML/CDI
+  reading remains open.
+* **Phase 2 — substantially met**: all six routes implemented; streaming `/generate` with
+  cancellation and backpressure (D3); structural default-deny privacy at admission **and**
+  execution (D5 + implemented CA-1); outage-as-refusal tested. Caveat, stated precisely: the
+  gate names *AgentConnect's existing local-manager tests*; what has run is AgentConnect's
+  shipped client driven by ComputeConnect's own conformance suite — AgentConnect's in-repo test
+  suite has not been pointed at a live ComputeConnect yet.
+* **Phase 3 — not started** (no lifecycle management of any engine).
+* **Phase 4 — contract half exercised early**: the simulated cloud provider exists, changes
+  placement decisions, and the fail-closed privacy path is tested hard. The
+  execution-delegation items (Quadlet/podman/systemd intents) are untouched, and the
+  product-value caveat stands in full (see STATUS.md's D2 re-evaluation).
+* **Phase 5 — not started.**
+
 **Architecture first.** No phase below begins until the phase above it has passed its gate.
 
 **All of D1–D6 are ratified** ([ARCHITECTURE.md §8](ARCHITECTURE.md#8-decisions)). The architecture

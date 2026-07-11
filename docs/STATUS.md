@@ -1,6 +1,6 @@
 # Status
 
-**Last updated:** 2026-07-11
+**Last updated:** 2026-07-12
 
 Read this before proposing work. It is the honest version.
 
@@ -8,147 +8,123 @@ Read this before proposing work. It is the honest version.
 
 ## What exists
 
-Documentation and a license. That is the whole repository.
+A minimal but real runtime: the `computeconnect` Python package, **v0.1.0**.
 
 | Thing | State |
 |---|---|
-| `README.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `docs/STATUS.md`, `docs/CONTRACT.md` | Drafted |
-| `LICENSE` | **Apache-2.0** (D6, 2026-07-11) |
-| Server, CLI, library, package, API | **None** |
-| Tests | **None** — there is nothing to test |
-| Language, dependencies | **Undecided** |
-| Compute nodes under management | **Zero.** One node is *described*; nothing manages it. |
+| `computeconnect` package (`pyproject.toml`, `src/computeconnect/`) | **Implemented.** Python 3.11, Starlette + uvicorn + httpx. |
+| CLI | `computeconnect serve`, default port **8090** (8080 is the external llama.cpp engine, 8787 is reserved for BrainConnect). |
+| Layer 1 control plane | All six `LocalComputeProvider` routes: `GET /health`, `GET /models`, `GET /models/loaded`, `POST /route/estimate`, `POST /generate`, `POST /runs/{run_id}/cancel`. Plus additive `GET /runs/{run_id}` metadata. |
+| Layer 2 inference API | `GET /v1/models`, `POST /v1/chat/completions` (SSE streaming and non-streaming), same backend as Layer 1. |
+| `/generate` streaming (D3) | Implemented: incremental single-JSON-document stream, one-delta backpressure, cancellation propagates to the upstream engine (verified: the upstream sees the disconnect mid-generation). |
+| Structural privacy (D5) | Implemented as a staged pipeline: `resolve_privacy_tier` defaults closed, `filter_candidates` is the only constructor of the `CandidateSet` type, and placement/estimate accept only a `CandidateSet`. Cloud is filtered **before** placement; empty set ⇒ structured refusal. |
+| Amendments | **CA-1** (optional `privacy_tier` on `/generate`, absent ⇒ most restrictive, positive re-verify) and **CA-3** (`run_id` in body + `X-Run-Id` header) implemented; see [CONTRACT.md](CONTRACT.md). CA-2 remains proposed. |
+| Providers registered by default | Two: the local llama.cpp host (read-only upstream on `:8080`; ComputeConnect never manages its lifecycle) and a **simulated** cloud provider (in-process, distinct placement class `cloud`, distinct capabilities and capacity). |
+| Tests | 64 pytest tests: privacy property tests, placement, all six routes over real HTTP (uvicorn on ephemeral ports, not an in-process shim), streaming/cancellation/disconnect, OpenAI layer, fault injection (upstream down, mid-stream engine failure), conformance driven by AgentConnect's **shipped** `HttpLocalComputeProvider` imported from the sibling checkout, and 6 tests against the **real** llama.cpp engine (skip when `:8080` is unreachable). |
+| Gate | `cd ComputeConnect && .venv/bin/python -m pytest` — 64 passed on 2026-07-12 with the real engine reachable. |
 
-Nothing in ComputeConnect runs, and nothing depends on ComputeConnect.
+## What was verified, on this host, 2026-07-12
 
-**Licensing decision (D6):** the repository is **Apache-2.0**. Chosen for the explicit patent grant
-(more appropriate to a compute control plane than MIT), for ecosystem consistency with the
-infrastructure it integrates — Kubernetes, Ray, vLLM, containerd — and to match BrainConnect, the
-one sibling that already carries a license.
+* `computeconnect serve --port 8090` answered `/health` (`ok`, both providers), `/models`
+  (`qwen3-30b-a3b` + `sim-cloud-large`), and a real `/v1/chat/completions` against the live
+  engine (output `"OK."`). Manually, not only under pytest.
+* A real `/generate` through the streaming proxy against `:8080` succeeded, and a real 1024-token
+  generation was **cancelled mid-stream** and stopped early.
+* AgentConnect's shipped client (`HttpLocalComputeProvider`) ran `health/inventory/loaded/estimate`
+  against ComputeConnect backed by the real engine (ROADMAP Phase 1 gate), and
+  `run()/cancel()` against the fake-upstream stack.
+* The `wiki-llama` systemd unit was consumed **read-only**. Nothing here starts, stops, loads,
+  unloads, or reconfigures it — lifecycle delegation (ARCHITECTURE §2.1) is **not implemented**.
 
----
-
-## What was verified, on this host, today
-
-Measured directly on 2026-07-10, not assumed:
-
-| Fact | Value | How |
-|---|---|---|
-| Architecture | `aarch64`, Cortex-A720, 12 CPUs | `lscpu` |
-| Accelerator | **None** | no GPU on this box |
-| Inference engine | `llama.cpp`, reachable on `:8080` | `curl /health` → `{"status":"ok"}` |
-| Engine supervisor | `wiki-llama`, a **systemd user unit**, active | `systemctl --user is-active` |
-| Model resident | `qwen3-30b-a3b`, GGUF | `GET /v1/models` |
-| `GET /models` | returns `200` | `curl` |
-
-Two consequences that shape the roadmap:
-
-* The one real node is **bare systemd, not a container**. No CDI, no Podman, no Kubernetes is in
-  the loop. The container-runtime paths in ARCHITECTURE are, on this host, theory.
-* The one real node has **no accelerator**. The NVML/CDI/DCGM capability paths have **no live
-  coverage** and cannot be tested here. Any code written against them is unverified by
-  construction until a second node exists.
-
-### Verified from sibling repositories
-
-* **AgentConnect already defines this product's primary contract.**
-  `mcp-agentconnect/packages/agentconnect-core/src/agentconnect/core/local_compute.py` contains the
-  `LocalComputeProvider` ABC, an `HttpLocalComputeProvider` client, and a `LocalModelManagerWorkerAdapter`.
-  The six endpoints in ARCHITECTURE §7.1 are copied from that client, not invented here.
-* **BrainConnect is WikiBrain, renamed**, per `Connect/README.md`. The rename is incomplete; the
-  code still says `wiki`.
-* **BrainConnect's librarian is a compute consumer.** `WikiBrain/cli/librarian/client.py` targets a
-  configurable OpenAI-compatible `base_url`, defaulting to Ollama's `:11434`. The `wiki-llama`
-  service on `:8080` is a hand-managed instance of what ComputeConnect exists to manage.
-* **ToolConnect now has a validated Phase 1 runtime** but no execution/invoke surface — so there is
-  still no compute-facing contract to conform to.
-
----
-
-## What is *not* verified
+## What is *not* implemented or verified
 
 Stated so nobody builds on it by accident:
 
-* **llama.cpp router-mode `POST /models/load` and `POST /models/unload`.** Reported by research
-  against upstream source (router mode, ~Dec 2025) and used in ARCHITECTURE §3. **Not probed on
-  this build.** `GET /models` returns 200 here, which is necessary but not sufficient. Verify
-  before Phase 3 delegates to it.
-* Every claim about **vLLM, Ray, MLX, Ollama, Kubernetes DRA, CDI, LocalAI, llama-swap, and
-  LiteLLM** comes from web research conducted 2026-07-10, not from running any of them. Two
-  precision notes carried forward from that research:
-  * DRA reached **GA in Kubernetes v1.34** (2025-08-27). One intermediate summary said v1.35; that
-    is wrong.
-  * **CDI is a CNCF *TAG Runtime working-group specification*, not a CNCF Sandbox/Incubating/
-    Graduated project.** Do not write "the CNCF CDI project."
-* LiteLLM's `enterprise/` license carve-out was verified verbatim from its root `LICENSE`. Its
-  pricing, and any security-incident history, were **not** verified against primary sources and are
-  deliberately absent from these documents.
+* **No lifecycle management.** No load/unload delegation, no llama.cpp router-mode verbs (still
+  unprobed on this build), no llama-swap-style start/stop. The "loaded-model state" is read, not
+  managed.
+* **No capability normalizer.** No `lscpu`/NVML/CDI/NFD reading. Capabilities are operator-declared
+  tags on the provider registration. The ARCHITECTURE §4 `Capability` schema is unbuilt, and on
+  this accelerator-less host most of it would be untestable anyway.
+* **No multi-node anything.** One process, providers configured in-process. No remote node agent,
+  no mTLS (AgentConnect's checklist item 4 — the local plane here is loopback HTTP), no
+  LiteLLM feeding.
+* **The cloud provider is simulated.** It exists to exercise the candidate pipeline and the
+  privacy invariant, and it does — but it proves contract behavior, not product value.
+* `estimated_queue_seconds` beyond capacity is a declared heuristic (30 s per backlogged run), not
+  a measurement. `usage` token counts on the OpenAI layer are length-based approximations.
+
+---
+
+## Abandonment re-evaluation (D2), 2026-07-12
+
+The ratified condition: *abandon if only a single homogeneous host is demonstrated and maintained
+single-node software already solves the use case.*
+
+**What v0.1.0 demonstrates:** the *contract* claim of ARCHITECTURE §9 — registry, candidate
+filtering, placement intent, structural default-deny privacy, streaming proxy, cancellation — all
+validated with two logically distinct providers, exactly as the validation plan allowed. The
+simulated second provider does change placement decisions (a cloud-only capability routes to it
+when the tier permits, and is structurally refused when it does not), so the placement policy has
+content.
+
+**What v0.1.0 does not demonstrate:** the *product-value* claim. There is still **exactly one real
+node** — this ARM box, no accelerator — and the second provider is a simulation written by this
+repository. A simulated counterparty cannot demonstrate heterogeneous placement value, and we do
+not claim it does. On today's demonstrated hardware, the D2 comparison stands: **llama-swap plus
+LiteLLM, or LocalAI, would serve a single-host user as well or better** than ComputeConnect's
+current runtime, with more maturity.
+
+**Why this is not yet the abandonment case:** the condition has two clauses. The second —
+"maintained single-node software already solves the use case" — is not fully true for *this*
+use case: no maintained single-node system serves AgentConnect's six-route control-plane contract
+(estimate/refusal semantics, structural privacy tiers, run cancellation) while also exposing the
+standard inference surface; that adapter layer is precisely what v0.1.0 is. The honest reading:
+ComputeConnect currently earns its keep **as the conformance implementation of the Connect compute
+contract**, not as a heterogeneous placement engine.
+
+**What would settle it, either way:**
+
+* **Falsifies the premise:** a real second node of a different shape (an accelerator, or a Mac
+  where `gpu_requires_host_process` is true) arrives, and placement across it delivers no decision
+  a static config could not — or the node never arrives and the contract-adapter role gets
+  absorbed into AgentConnect itself. Then D2 says stop, and this document must say so.
+* **Validates the premise:** a real heterogeneous placement decision — same workload, different
+  nodes chosen for capability/capacity reasons a request router cannot see — observed on real
+  hardware.
+
+Until one of those happens, the multi-node placement value claim remains **unmade, not disproven**,
+and must not be asserted. The simulated provider must never be cited as evidence of heterogeneity.
 
 ---
 
 ## Decisions — all ratified
 
-Full text in [ARCHITECTURE.md §8](ARCHITECTURE.md#8-decisions). D1–D2 on 2026-07-10; **D3–D6 on
-2026-07-11**.
+Full text in [ARCHITECTURE.md §8](ARCHITECTURE.md#8-decisions). D1–D2 on 2026-07-10; D3–D6 on
+2026-07-11. Implementation status of each, as of v0.1.0:
 
-| # | Decision |
-|---|---|
-| **D1** | Provider registry means **compute environments and execution planes** — a local host, a remote host, a Kubernetes cluster, a rented GPU node, a runtime service tied to compute capacity. **Not** generic LLM API providers. Cloud model-provider routing stays delegated to LiteLLM or an equivalent gateway, which ComputeConnect may *integrate with* when placement requires it. |
-| **D2** | Design-validation rule: if the demonstrated use case remains a single local host with no heterogeneous placement problem, prefer maintained single-node systems (LocalAI, llama-swap, Ollama, LiteLLM) over building ComputeConnect. Discipline, not a foregone conclusion to delete the repository. |
-| **D3** | `/generate` is a **thin streaming proxy**: ComputeConnect stays in the request path (AgentConnect reads output inline), streams without large buffering, and propagates cancellation and backpressure. Dispatch-by-reference deferred to CA-2. |
-| **D4** | **Two APIs, one backend.** Layer 1 control plane (`LocalComputeProvider`) for AgentConnect; Layer 2 OpenAI-compatible inference for BrainConnect and direct apps. Not one surface with an alias. |
-| **D5** | **Structural default-deny privacy.** Cloud providers filtered from the candidate set before placement; unknown/missing/local-only ⇒ no cloud; empty set ⇒ structured refusal; never a silent downgrade. |
-| **D6** | **Apache-2.0.** |
-
-## Contract ambiguities in AgentConnect's surface
-
-Documented in [ARCHITECTURE §7.1](ARCHITECTURE.md#71-agentconnect-conformance). Neither blocks
-safety or Phase 1 any longer; both are recorded as future amendments in
-[CONTRACT.md](CONTRACT.md#future-amendments):
-
-* **`privacy_tier` is absent from `LocalRunRequest`** (present on `LocalEstimateRequest`). No longer
-  a blocker: the structural default-deny invariant (§6) makes the system safe without it. The
-  positive re-check amendment is **CA-1**.
-* **`POST /generate` returns no `run_id`**, which `POST /runs/{run_id}/cancel` requires. Addressed by
-  the dispatch-by-reference amendment **CA-2**. Both amendments are AgentConnect's to make; neither
-  is required before ComputeConnect implementation begins.
-
-## Hardware validation plan
-
-No hardware purchase is required before Phase 1.
-
-| Claim | What validates it | Available today? |
+| # | Decision | v0.1.0 |
 |---|---|---|
-| **Contract validity** — registry, capability schema, admission, placement intent, fail-closed privacy | **Two logically distinct providers** differing in capability or policy. One may be **simulated, containerized, remote, or CPU-only**. | **Yes.** One real CPU-only llama.cpp host plus a simulated provider. |
-| **Product value** — heterogeneous placement is worth doing | A **real** second node of a different shape: an accelerator, or a Mac where `gpu_requires_host_process` is true. | **No.** |
+| **D1** | Provider = compute environment, not LLM-API provider | Held: providers are a local host and a (simulated) cloud environment; no LiteLLM replacement built. |
+| **D2** | Design-validation rule | Re-evaluated above, honestly. |
+| **D3** | `/generate` thin streaming proxy | Implemented and tested (streaming, backpressure via one-delta pull, cancellation, disconnect). |
+| **D4** | Two APIs, one backend | Implemented: both layers share one registry, one run tracker, one generation path per engine. |
+| **D5** | Structural default-deny privacy | Implemented as pipeline structure, tested including local-down/cloud-capable hard cases. |
+| **D6** | Apache-2.0 | Unchanged. |
 
-Until the second row is satisfied, the production multi-node placement claim is **unmade, not
-disproven**, and must not be asserted.
+## Contract ambiguities — disposition
 
----
+Of the five ambiguities recorded in ARCHITECTURE §7.1: (1) `run_id` — **closed by CA-3**;
+(2) streaming — **closed by D3's implementation** (documented in CONTRACT.md); (3) `privacy_tier`
+at execution — **closed server-side by CA-1** (AgentConnect's `LocalRunRequest` still does not
+carry it; default-closed covers that); (4) `estimated_quality` scale — **defined** as deployment-
+local `[0,1]`; (5) topology hidden in `runtime`/`reason` — unchanged, `reason` now carries the
+full placement rationale and rejection list.
 
 ## Known inconsistencies outside this repository
 
-Recorded, not acted on. **This repository's scope is ComputeConnect only**; the fixes below belong
-to whoever owns those repos.
-
-* `Connect/README.md` lists ComputeConnect as *"Reserved. Name claimed. Scope undefined."* That is
-  now stale — this document set defines the scope. The ecosystem table needs updating, and the
-  status table's `—` in ComputeConnect's repository column needs a link.
-* `ToolConnect/README.md` links to `docs/STATUS.md`, which **does not exist** in that repository.
-* Per `Connect/README.md`, the BrainConnect rename is in progress: packages, the MCP server, and
-  the `brain_*` tools all still carry `wiki` names.
-
----
-
-## The honest summary
-
-ComputeConnect has a **real but narrow** justification: nothing surveyed owns cross-host,
-cross-runtime compute capability and lifecycle for a heterogeneous, Kubernetes-optional fleet. It
-also has a **real risk of being redundant**: on one box, `llama-swap` plus LiteLLM covers Phases
-1–3, and LocalAI covers most of the idea outright.
-
-The premise that distinguishes it — heterogeneity — is **currently undemonstrated, because there is
-exactly one provider and it has no accelerator.** Contracts and policy can be validated now against
-a simulated second provider. The *value* claim cannot, and per **D2** it should not be asserted
-until a genuine heterogeneous placement problem exists.
+* `Connect/README.md` still lists ComputeConnect as design-phase/scope-undefined; as of v0.1.0
+  there is a runtime. Owned by the Connect repo.
+* The BrainConnect rename remains in progress; its librarian still targets an OpenAI-compatible
+  `base_url` and can point at `:8090/v1` unchanged — but nothing has been rewired, and `:8787`
+  remains reserved for BrainConnect's own serve.
