@@ -1,6 +1,6 @@
 # Status
 
-**Last updated:** 2026-07-10
+**Last updated:** 2026-07-11
 
 Read this before proposing work. It is the honest version.
 
@@ -8,17 +8,23 @@ Read this before proposing work. It is the honest version.
 
 ## What exists
 
-Four documents. That is the whole repository.
+Documentation and a license. That is the whole repository.
 
 | Thing | State |
 |---|---|
-| `README.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `docs/STATUS.md` | Drafted |
+| `README.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `docs/STATUS.md`, `docs/CONTRACT.md` | Drafted |
+| `LICENSE` | **Apache-2.0** (D6, 2026-07-11) |
 | Server, CLI, library, package, API | **None** |
 | Tests | **None** — there is nothing to test |
-| Language, dependencies, license | **Undecided** (D6) |
+| Language, dependencies | **Undecided** |
 | Compute nodes under management | **Zero.** One node is *described*; nothing manages it. |
 
 Nothing in ComputeConnect runs, and nothing depends on ComputeConnect.
+
+**Licensing decision (D6):** the repository is **Apache-2.0**. Chosen for the explicit patent grant
+(more appropriate to a compute control plane than MIT), for ecosystem consistency with the
+infrastructure it integrates — Kubernetes, Ray, vLLM, containerd — and to match BrainConnect, the
+one sibling that already carries a license.
 
 ---
 
@@ -48,13 +54,14 @@ Two consequences that shape the roadmap:
 * **AgentConnect already defines this product's primary contract.**
   `mcp-agentconnect/packages/agentconnect-core/src/agentconnect/core/local_compute.py` contains the
   `LocalComputeProvider` ABC, an `HttpLocalComputeProvider` client, and a `LocalModelManagerWorkerAdapter`.
-  The six endpoints in ARCHITECTURE §5.1 are copied from that client, not invented here.
+  The six endpoints in ARCHITECTURE §7.1 are copied from that client, not invented here.
 * **BrainConnect is WikiBrain, renamed**, per `Connect/README.md`. The rename is incomplete; the
   code still says `wiki`.
 * **BrainConnect's librarian is a compute consumer.** `WikiBrain/cli/librarian/client.py` targets a
   configurable OpenAI-compatible `base_url`, defaulting to Ollama's `:11434`. The `wiki-llama`
   service on `:8080` is a hand-managed instance of what ComputeConnect exists to manage.
-* **ToolConnect has no runtime either** — its repository is a single `README.md`.
+* **ToolConnect now has a validated Phase 1 runtime** but no execution/invoke surface — so there is
+  still no compute-facing contract to conform to.
 
 ---
 
@@ -79,37 +86,32 @@ Stated so nobody builds on it by accident:
 
 ---
 
-## Decisions
+## Decisions — all ratified
 
-Full text in [ARCHITECTURE.md §6](ARCHITECTURE.md#6-decisions).
-
-**Ratified 2026-07-10:**
+Full text in [ARCHITECTURE.md §8](ARCHITECTURE.md#8-decisions). D1–D2 on 2026-07-10; **D3–D6 on
+2026-07-11**.
 
 | # | Decision |
 |---|---|
-| **D1** | Provider registry means **compute environments and execution planes** — a local host, a remote host, a Kubernetes cluster, a rented GPU node, a runtime service tied to compute capacity. **Not** generic LLM API providers. ComputeConnect is not a LiteLLM replacement and not a cloud-LLM API proxy; cloud model-provider routing stays delegated to LiteLLM or an equivalent gateway, which ComputeConnect may *integrate with* when placement requires it. |
-| **D2** | Design-validation rule: if the demonstrated use case remains a single local host with no heterogeneous placement problem, prefer maintained single-node systems (LocalAI, llama-swap, Ollama, LiteLLM) over building ComputeConnect. **This is discipline, not a foregone conclusion to delete the repository.** |
+| **D1** | Provider registry means **compute environments and execution planes** — a local host, a remote host, a Kubernetes cluster, a rented GPU node, a runtime service tied to compute capacity. **Not** generic LLM API providers. Cloud model-provider routing stays delegated to LiteLLM or an equivalent gateway, which ComputeConnect may *integrate with* when placement requires it. |
+| **D2** | Design-validation rule: if the demonstrated use case remains a single local host with no heterogeneous placement problem, prefer maintained single-node systems (LocalAI, llama-swap, Ollama, LiteLLM) over building ComputeConnect. Discipline, not a foregone conclusion to delete the repository. |
+| **D3** | `/generate` is a **thin streaming proxy**: ComputeConnect stays in the request path (AgentConnect reads output inline), streams without large buffering, and propagates cancellation and backpressure. Dispatch-by-reference deferred to CA-2. |
+| **D4** | **Two APIs, one backend.** Layer 1 control plane (`LocalComputeProvider`) for AgentConnect; Layer 2 OpenAI-compatible inference for BrainConnect and direct apps. Not one surface with an alias. |
+| **D5** | **Structural default-deny privacy.** Cloud providers filtered from the candidate set before placement; unknown/missing/local-only ⇒ no cloud; empty set ⇒ structured refusal; never a silent downgrade. |
+| **D6** | **Apache-2.0.** |
 
-**Open:**
+## Contract ambiguities in AgentConnect's surface
 
-| # | Question | Blocking |
-|---|---|---|
-| **D3** | Is `/generate` a proxy (data path) or a reference (control plane only)? | Phase 2 |
-| **D4** | One consumer surface, or two? | Phase 2, BrainConnect integration |
-| **D5** | How is local-only privacy *structurally enforced*, not merely honored? | **Phase 5 — hard blocker.** No cloud provider may be reachable before this is answered. Requires settling contract ambiguity (3) with AgentConnect. |
-| **D6** | License | First external contribution |
+Documented in [ARCHITECTURE §7.1](ARCHITECTURE.md#71-agentconnect-conformance). Neither blocks
+safety or Phase 1 any longer; both are recorded as future amendments in
+[CONTRACT.md](CONTRACT.md#future-amendments):
 
-## Contract ambiguities awaiting AgentConnect
-
-Documented in [ARCHITECTURE §5.1](ARCHITECTURE.md#51-agentconnect-conformance), **not silently
-resolved.** The load-bearing two:
-
-* **`POST /runs/{run_id}/cancel` requires a `run_id` that `POST /generate` never returns.** The
-  shipped `LocalRunResult` carries no identifier, so cancellation is unreachable through the shipped
-  client path.
-* **`privacy_tier` is an input to `/route/estimate` but absent from `LocalRunRequest`.** The
-  enforcement point for a local-only workload is therefore unspecified — which is why D5 cannot be
-  answered by ComputeConnect alone.
+* **`privacy_tier` is absent from `LocalRunRequest`** (present on `LocalEstimateRequest`). No longer
+  a blocker: the structural default-deny invariant (§6) makes the system safe without it. The
+  positive re-check amendment is **CA-1**.
+* **`POST /generate` returns no `run_id`**, which `POST /runs/{run_id}/cancel` requires. Addressed by
+  the dispatch-by-reference amendment **CA-2**. Both amendments are AgentConnect's to make; neither
+  is required before ComputeConnect implementation begins.
 
 ## Hardware validation plan
 
