@@ -5,7 +5,8 @@ is capable of*, *whether it is healthy*, *whether a given model will fit on it*,
 workload should run*.
 
 ComputeConnect is **architecture and interfaces only**. There is no runtime, no server, and no
-code in this repository. See [docs/STATUS.md](docs/STATUS.md) before proposing work.
+code in this repository. Licensed **Apache-2.0** ([LICENSE](LICENSE)). See
+[docs/STATUS.md](docs/STATUS.md) before proposing work.
 
 ---
 
@@ -44,6 +45,22 @@ to an OpenAI-compatible local endpoint. ComputeConnect is the thing that should 
 end of both — and one of those contracts is already written, so ComputeConnect conforms to it
 rather than inventing a new one.
 
+## Standalone by design
+
+**ComputeConnect can be used on its own.** It depends on no sibling project. AgentConnect uses it
+for orchestration, BrainConnect uses it for inference, and any other application may use it
+directly:
+
+* Applications and AgentConnect drive the **control-plane API** (`LocalComputeProvider`) — placement,
+  admission, health, cancellation.
+* BrainConnect and direct applications use the **OpenAI-compatible inference API** — the same dialect
+  every engine already speaks.
+
+Both surfaces reach one execution backend. The two-API split is specified in
+[ARCHITECTURE.md §5](docs/ARCHITECTURE.md#5-two-apis-one-backend); the stable interface itself lives
+in [docs/CONTRACT.md](docs/CONTRACT.md). No sibling product is required to run or build against
+ComputeConnect.
+
 ## Status at a glance
 
 Nothing runs. One compute node exists, and today it is described, not managed.
@@ -51,11 +68,13 @@ Nothing runs. One compute node exists, and today it is described, not managed.
 | Deliverable | State |
 |---|---|
 | Product boundaries | Drafted — [ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| AgentConnect contract | **Already specified by AgentConnect**; ComputeConnect must conform. Two ambiguities documented, not patched. |
-| BrainConnect contract | Drafted — a compute consumer, not a peer scheduler |
-| ToolConnect contract | **Provisional** — ToolConnect has no runtime; nothing may be built against it |
+| Contracts | Locked — [CONTRACT.md](docs/CONTRACT.md): two APIs, five binding invariants, amendments CA-1/CA-2 |
+| AgentConnect contract | **Already specified by AgentConnect**; ComputeConnect conforms. Ambiguities carried as CA-1/CA-2. |
+| BrainConnect contract | Drafted — a compute consumer on the inference API, not a peer scheduler |
+| ToolConnect contract | **Provisional** — validated runtime but no compute-facing surface yet |
 | Code | None. Intentionally. |
-| Decisions | **D1, D2 ratified.** D3–D6 open — see [STATUS.md](docs/STATUS.md) |
+| Decisions | **D1–D6 all ratified** — see [STATUS.md](docs/STATUS.md) |
+| License | **Apache-2.0** |
 
 ## The honest risk
 
@@ -75,6 +94,8 @@ single-node systems — LocalAI, llama-swap, Ollama, LiteLLM — over building C
 
 ## Documents
 
-* [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — boundaries, objects, prior art, integration contracts
+* [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — boundaries, objects, prior art, the two APIs, the privacy invariant, integration contracts
+* [docs/CONTRACT.md](docs/CONTRACT.md) — the stable interface surface and its future amendments
 * [docs/ROADMAP.md](docs/ROADMAP.md) — phases and the gate for each
-* [docs/STATUS.md](docs/STATUS.md) — what is true today, and the decisions that block work
+* [docs/STATUS.md](docs/STATUS.md) — what is true today, and the ratified decisions
+* [LICENSE](LICENSE) — Apache-2.0

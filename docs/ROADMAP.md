@@ -2,16 +2,15 @@
 
 **Architecture first.** No phase below begins until the phase above it has passed its gate.
 
-**D1** (compute providers, not LLM-API providers) and **D2** (the design-validation rule) are
-ratified. **D3–D6** in [ARCHITECTURE.md](ARCHITECTURE.md#6-decisions) remain open and block the
-phases that name them.
+**All of D1–D6 are ratified** ([ARCHITECTURE.md §8](ARCHITECTURE.md#8-decisions)). The architecture
+and contracts are locked; the phases below no longer wait on a decision.
 
 Each phase states a **gate**: an observable condition, not a feeling of doneness. A phase with no
 falsifiable gate is not on this roadmap.
 
 **No hardware purchase is required before Phase 1.** Contract validation uses two logically distinct
 providers, one of which may be simulated, containerized, remote, or CPU-only. See
-[ARCHITECTURE §7](ARCHITECTURE.md#7-validation-contract-versus-product-value) for why that is
+[ARCHITECTURE §9](ARCHITECTURE.md#9-validation-contract-versus-product-value) for why that is
 sufficient for contracts and insufficient for product value.
 
 ---
@@ -21,12 +20,14 @@ sufficient for contracts and insufficient for product value.
 Define what ComputeConnect is, what it refuses to be, and what it must conform to.
 
 * Product boundaries, with prior-art collisions resolved by name.
-* Integration contracts for AgentConnect, BrainConnect, ToolConnect.
-* Decisions D1–D6 raised; **D1 and D2 ratified**.
-* Ambiguities in AgentConnect's published contract documented rather than silently resolved.
+* Integration contracts for AgentConnect, BrainConnect, ToolConnect ([CONTRACT.md](CONTRACT.md)).
+* **All of D1–D6 ratified.** Dual-API architecture (D4), thin streaming proxy (D3), structural
+  default-deny privacy (D5), and Apache-2.0 (D6) are locked.
+* Ambiguities in AgentConnect's published contract documented, not silently resolved, and carried
+  as future amendments **CA-1** and **CA-2**.
+* `LICENSE` (Apache-2.0) added.
 
-**Gate:** the four documents committed and pushed, with D1 stating *compute* providers and D2
-stated as a design-validation rule. **Met.**
+**Gate:** the documents and license committed and pushed, contracts locked. **Met.**
 
 **Not in this phase:** any code, any dependency choice, any language choice.
 
@@ -49,7 +50,7 @@ real service, not a mock.
 
 **Why read-only first:** it forces the registry and capability schema to be right before anything
 depends on them, and it is the cheapest possible test of whether the capability record contains
-anything `ollama ps` does not already give away — the falsification test in ARCHITECTURE §7.
+anything `ollama ps` does not already give away — the falsification test in ARCHITECTURE §9.
 
 ---
 
@@ -60,13 +61,16 @@ Complete the surface AgentConnect's client already calls.
 * `POST /route/estimate` — admission. Given `{task_type, privacy_tier, required_capabilities,
   context_tokens, ...}`, answer eligible / not, with a **reason**. This is the first real
   ComputeConnect logic: model-fit against a `Capability` record.
-* `POST /generate` — per **D3**, a proxy. Streaming, cancellation, and backpressure become
-  ComputeConnect's problem the moment this exists.
+* `POST /generate` — per **D3**, a **thin streaming proxy**: stream without buffering, propagate
+  cancellation and backpressure, stay as transparent as possible.
 * `POST /runs/{run_id}/cancel` — best-effort, per the contract.
+* Privacy: the structural default-deny filter (**D5**, ARCHITECTURE §6) is enforced at admission.
+  Because `LocalRunRequest` carries no `privacy_tier`, `/generate` assumes the most restrictive tier
+  when none is present — the safe default — pending amendment **CA-1**.
 
 **Gate:** AgentConnect's existing local-manager tests pass against a live ComputeConnect with no
 changes to AgentConnect. If they cannot, the contract was misread and Phase 2 reopens
-ARCHITECTURE §5.1.
+ARCHITECTURE §7.1.
 
 **Watch for:** an outage of ComputeConnect must surface in AgentConnect as
 `health.available = False` and a routed-elsewhere task — never as an exception. Test the outage,
@@ -161,4 +165,18 @@ layer built before a correct capability schema will place things wrong with grea
 Because Phase 4 can now be entered with a *simulated* second provider, that tension is cheaper than
 it first appeared: pulling it earlier costs a fake, not a purchase. The maintainer should decide the
 ordering, but hardware acquisition is no longer on the critical path — only the product-value claim
-in [ARCHITECTURE §7](ARCHITECTURE.md#7-validation-contract-versus-product-value) is.
+in [ARCHITECTURE §9](ARCHITECTURE.md#9-validation-contract-versus-product-value) is.
+
+---
+
+## Future contract amendments
+
+Tracked in [CONTRACT.md](CONTRACT.md#future-amendments). Neither is required before implementation;
+both are AgentConnect's to make.
+
+* **CA-1 — Carry `privacy_tier` into `LocalRunRequest`.** Lets `/generate` positively re-verify the
+  privacy decision instead of relying solely on the default-deny candidate filter. Defense in depth;
+  the structural invariant (§6) already makes the system safe without it.
+* **CA-2 — Dispatch-by-reference for `/generate`.** Would let ComputeConnect leave the token hot
+  path and supply the `run_id` that `/runs/{run_id}/cancel` needs. Deferred; the thin streaming proxy
+  is the ratified design for now.

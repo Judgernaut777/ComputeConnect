@@ -15,27 +15,33 @@ ComputeConnect is the **compute plane**. It sits below the request plane and abo
 substrate.
 
 ```
+   AgentConnect            BrainConnect · direct applications
+        │                            │
+   control-plane API         OpenAI-compatible inference API
+   (LocalComputeProvider)    (/v1/chat/completions)
+        ▼                            ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │  AgentConnect (tasks)   BrainConnect (memory)   ToolConnect  │   consumers of compute
-  └───────────────┬──────────────────┬───────────────────────────┘
-                  │                  │
-                  │  LocalComputeProvider contract (already specified by AgentConnect)
-                  ▼                  ▼
+  │                        ComputeConnect                         │
+  │  ┌─ Control plane ──────────────┐ ┌─ Inference API ────────┐  │
+  │  │ placement · routing ·        │ │ standard OpenAI-        │  │
+  │  │ scheduling · admission ·     │ │ compatible surface;     │  │
+  │  │ capacity · health ·          │ │ NOT another routing     │  │
+  │  │ cancellation · selection     │ │ layer                   │  │
+  │  └──────────────┬───────────────┘ └───────────┬────────────┘  │
+  │                 └───── same execution backend ─┘              │
+  └────────────────────────────┬─────────────────────────────────┘
+                               │  placement intent  (never a scheduler)
+                               ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │                       ComputeConnect                          │
-  │                                                               │
-  │   compute registry · runtime registry · compute-provider      │
-  │   registry · capability normalizer · admission (will it fit)  │
-  │   · model lifecycle · health rollup · placement policy        │
-  └───────────────┬──────────────────────────────────────────────┘
-                  │  placement intent  (never a scheduler)
-                  ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  Engines:   llama.cpp   vLLM   Ollama   MLX                   │
+  │  Engines:   llama.cpp   vLLM   Ollama   MLX   LocalAI         │
   │  Runtimes:  systemd   Podman   Docker   Kubernetes   Ray      │
   │  Detection: NVML   CDI   NFD   DCGM   /proc/cpuinfo           │
   └──────────────────────────────────────────────────────────────┘
 ```
+
+Two consumers, two API surfaces, **one execution backend** — detailed in §5. They are not competing
+systems: AgentConnect drives the control plane, BrainConnect and direct applications use the
+inference API, and both ultimately reach the same engines.
 
 The single sentence that constrains every design choice below:
 
@@ -84,7 +90,7 @@ If ComputeConnect does not stay inside it, it should not exist.
 Stated in the handoff, and confirmed by the survey:
 
 * **Tasks** → AgentConnect. ComputeConnect has no concept of a task, a subtask, or a handoff.
-* **Memory** → BrainConnect. ComputeConnect stores no facts and promotes nothing. See §5.2.
+* **Memory** → BrainConnect. ComputeConnect stores no facts and promotes nothing. See §7.2.
 * **Tools** → ToolConnect. ComputeConnect does not decide who may call what.
 * **Workflow engines** → out of scope entirely.
 * **Secrets managers** → out of scope. Credentials are referenced, never held.
@@ -315,11 +321,111 @@ see three, because the admission and lifecycle decisions depend on which level f
 
 ---
 
-## 5. Integration contracts
+## 5. Two APIs, one backend
+
+**Ratified — D4.** ComputeConnect exposes **two distinct API layers**. They are not two routers for
+the same job, and they must not be collapsed into one. They are different *layers* with different
+callers, and they terminate at the **same execution backend**.
+
+### Layer 1 — Control plane
+
+**Owned by ComputeConnect. Used by AgentConnect.** This is the layer that makes ComputeConnect a
+control plane rather than an inference server. Its responsibilities:
+
+* placement
+* routing (of compute, not of LLM-API providers — see D1)
+* scheduling *policy* (never a scheduler — see §4, `Placement`)
+* admission ("will it fit?")
+* health and capacity
+* cancellation
+* provider selection
+
+The existing `LocalComputeProvider` endpoints belong here: `GET /health`, `GET /models`,
+`GET /models/loaded`, `POST /route/estimate`, `POST /runs/{run_id}/cancel`. This is a *richer*
+surface than inference — no engine speaks it — and it is detailed as a conformance target in §7.1.
+
+### Layer 2 — Inference API
+
+**A standard OpenAI-compatible inference endpoint** (`/v1/chat/completions` and friends). Its
+purpose is compatibility, not orchestration:
+
+* BrainConnect's librarian, which already speaks this dialect
+* direct applications that want inference without knowing about the control plane
+* provider compatibility — every engine below (llama.cpp, vLLM, Ollama, MLX, LocalAI) already
+  serves this exact surface, so it is the lingua franca of the layer
+
+> **This is not another routing layer.** It is simply the standard inference interface. It carries
+> no placement or admission semantics of its own; it is the inference *verb* over whatever backend
+> the control plane has already made ready.
+
+### Both reach the same backend
+
+`POST /generate` on the control plane and `/v1/chat/completions` on the inference API are two doors
+into **one execution path**. The control plane adds estimate/admission/selection *around* a
+generation; the inference API is the bare generation. Neither owns a second copy of the engine, the
+model, or the runtime. A fact true of one — a model is resident, a node is at capacity — is true of
+the other, because there is only one backend underneath.
+
+This is why the split is layers, not duplication: remove the control plane and the inference API
+still works against a manually-chosen backend; remove the inference API and the control plane has no
+verb to execute what it placed.
+
+---
+
+## 6. Structural privacy enforcement
+
+**Ratified — D5. This is a hard architectural invariant, not a policy knob, a prompt convention, or
+a code comment.**
+
+### The problem it corrects
+
+`LocalEstimateRequest` carries a **required** `privacy_tier` field. `LocalRunRequest` does **not** —
+it carries only `model`, `task_type`, `prompt`, `context`, `max_output_tokens`, `temperature`, and a
+`metadata` dict (verified in AgentConnect's `local_compute.py`). So the *estimate* stage knows the
+privacy tier and the *execution* stage is blind to it. Any enforcement that lives only at execution
+time is therefore built on a value the execution stage cannot see.
+
+### The invariant
+
+**Cloud execution is default-denied.** Cloud providers are removed from the candidate set *before*
+placement runs, and only an explicit, cloud-permitting tier can put them back:
+
+```
+privacy tier is unknown    ──▶  no cloud candidates
+privacy tier is local-only ──▶  no cloud candidates
+privacy tier is missing    ──▶  no cloud candidates
+privacy tier explicitly
+  permits cloud             ──▶  cloud candidates eligible
+```
+
+Three properties make this structural rather than conventional:
+
+1. **The safe state is the default.** A caller who sets nothing gets local-only. Reaching a cloud
+   provider requires an affirmative, explicit permit — forgetting to set a field can never *widen*
+   exposure, only narrow it.
+2. **Filtering happens before placement, not after.** The candidate set handed to the placement
+   policy already excludes every non-compliant provider. Placement cannot select what it never saw;
+   there is no "downgrade" path to accidentally take.
+3. **No compliant provider ⇒ a structured refusal.** If filtering empties the candidate set, the
+   request is refused with a machine-readable reason. ComputeConnect **never silently downgrades**
+   privacy to make a placement succeed.
+
+### Why not just trust the tier at execution time
+
+Because the execution request does not carry the tier. Relying on the caller to re-send it in
+`metadata` would be exactly the "prompt convention" this invariant forbids: safety would depend on
+the caller remembering. The default-deny candidate filter holds even when the caller sends nothing,
+which is the whole point. A future contract amendment (§7.1, and CONTRACT.md **CA-1**) adds
+`privacy_tier` to `LocalRunRequest` so execution can *positively re-verify* the placement decision —
+defense in depth — but the invariant above must already make the system safe without it.
+
+---
+
+## 7. Integration contracts
 
 > No implementation. These define the boundary and the direction of the call.
 
-### 5.1 AgentConnect conformance
+### 7.1 AgentConnect conformance
 
 **Already specified. Conform, do not invent.**
 
@@ -384,15 +490,16 @@ before either side implements. Changing this surface unilaterally is not in scop
    on both.
 3. **`privacy_tier` is an input to `/route/estimate` but not to `/generate`.** `LocalRunRequest`
    carries `model`, `task_type`, `prompt`, `context`, `max_output_tokens`, `temperature`,
-   `metadata` — no tier. So the *enforcement point* for a local-only workload is unspecified: a
-   caller may estimate with one tier and generate with none. This is the contract-level face of
-   **D5**, and fail-closed enforcement cannot be built until it is resolved.
+   `metadata` — no tier. This is the contract-level face of **D5**. It does **not** block safety:
+   the structural default-deny invariant in §6 makes the system safe regardless, because the safe
+   state is the default. The amendment that adds `privacy_tier` here (CONTRACT.md **CA-1**) is
+   defense in depth — a positive re-check at execution time — not a prerequisite.
 4. **`estimated_quality` has no defined scale, units, or comparability** across models.
 5. **Topology is intentionally hidden**, so `runtime` and `reason` are the only channel through
    which ComputeConnect can explain *which* node it chose. Anything an operator needs to audit must
    fit there.
 
-### 5.2 BrainConnect — a compute consumer, not a peer
+### 7.2 BrainConnect — a compute consumer, not a peer
 
 BrainConnect is WikiBrain, renamed; the rename is in progress and the code still says `wiki`.
 
@@ -422,22 +529,23 @@ Three constraints:
    other candidate. A compute plane that writes its own facts into a trusted ledger has laundered
    the gate.
 3. **Privacy tier is an input, not an inference.** If a request requires local-only execution,
-   ComputeConnect must **fail closed**: refuse with a reason rather than place it on a rented cloud
-   GPU. Cloud providers are not considered at all for such workloads. Admission never downgrades
-   privacy to satisfy a placement. This must eventually be **structural policy, not a prompt
-   convention or a code comment**. **D5** covers the mechanism; there is no implementation in this
-   phase.
+   ComputeConnect **fails closed** per the structural invariant in §6: cloud providers are filtered
+   out of the candidate set before placement, and an empty set yields a structured refusal.
+   Admission never downgrades privacy to satisfy a placement. There is no implementation in this
+   phase; the invariant is the architecture.
 
-*Open:* whether BrainConnect consumes the OpenAI-compatible surface directly or the
-`LocalComputeProvider` surface. Reusing one surface for both consumers is simpler; the librarian
-already speaks OpenAI. **D4.**
+**Which surface (D4, ratified):** BrainConnect consumes the **Layer 2 inference API**
+(OpenAI-compatible), which its librarian already speaks. AgentConnect consumes the **Layer 1 control
+plane**. These are the two layers of §5, reaching the same backend — not one surface with an alias.
 
-### 5.3 ToolConnect — **provisional**
+### 7.3 ToolConnect (provisional)
 
 ToolConnect is a tool-governance layer: which tools exist, who may call them, whether they are
-healthy, what happened when they were called. It has **architecture documents but no runtime**, so
-this contract is drafted against a document, not a system. **It is provisional and nothing may be
-built against it.** Do not build against an unimplemented API.
+healthy, what happened when they were called. It now has a **validated Phase 1 runtime**, but **no
+execution/invoke surface** — governance decisions are made, not carried out through it. So there is
+no compute-facing contract to conform to yet, and this section stays **provisional**: the boundary
+is drawn, but **nothing may be built against it** until ToolConnect exposes a compute-relevant
+surface.
 
 The plausible relationship, stated so it can be argued with later: ToolConnect governs access to
 compute-management tools, or exposes compute capabilities as governed tools.
@@ -459,10 +567,10 @@ counterparty that cannot yet say "no" produces a contract that only one side has
 
 ---
 
-## 6. Decisions
+## 8. Decisions
 
-D1 and D2 are **ratified** (2026-07-10). D3–D6 remain open; work should not start on the phases
-that depend on them. Listed in [STATUS.md](STATUS.md) with the same numbering.
+**All of D1–D6 are ratified.** D1–D2 on 2026-07-10; D3–D6 on 2026-07-11. Listed in
+[STATUS.md](STATUS.md) with the same numbering.
 
 ### D1 — Provider means *compute provider* — **RATIFIED**
 
@@ -489,18 +597,46 @@ This is engineering discipline, and it is a rule to test the design against — 
 conclusion that the repository should be deleted. The obligation it creates is to demonstrate a
 heterogeneous placement problem, not to pre-emptively abandon.
 
-### Open
+### D3 — `/generate` is a thin streaming proxy — **RATIFIED**
 
-| # | Decision | Recommendation |
-|---|---|---|
-| **D3** | Does `POST /generate` proxy inference through ComputeConnect (data path), or return an endpoint reference for the caller to hit directly (control plane only)? | **Proxy, reluctantly** — AgentConnect's client already expects it. But design for dispatch-by-reference, because a control plane in the token hot path must then own streaming, backpressure, and cancellation. Interacts with ambiguities (1) and (2) in §5.1. |
-| **D4** | Do BrainConnect and AgentConnect consume one surface or two? | **One.** Serve the `LocalComputeProvider` surface, and expose an OpenAI-compatible alias for BrainConnect's existing librarian client. |
-| **D5** | How is a local-only privacy tier *structurally enforced*, rather than merely honored? | Unresolved, and a hard blocker on any cloud provider. Admission must fail closed. Needs a mechanism, not a promise — and §5.1 ambiguity (3) must be settled with AgentConnect first. |
-| **D6** | License for this repository. | Unresolved. The ecosystem's engines are MIT/Apache-2.0; no constraint forces a choice yet. |
+ComputeConnect stays in the request path, because AgentConnect's shipped client reads generated
+output inline and cannot be given a bare provider URL. But it stays there **as thinly as possible**:
+
+```
+Client ──▶ ComputeConnect ──▶ Provider ──▶ streaming response back through
+```
+
+* **Stream, do not buffer.** No large in-memory buffering of a generation; tokens pass through as
+  they are produced.
+* **Cancellation propagates** from client through ComputeConnect to the provider.
+* **Backpressure propagates** the same way.
+* ComputeConnect is **as transparent as possible** — a pass-through, not a staging buffer.
+
+Dispatch-by-reference is recorded as a possible future amendment (CONTRACT.md **CA-2**), not built
+now. This is the intended implementation; there is no streaming code in this phase.
+
+### D4 — Two APIs, separated by role — **RATIFIED**
+
+Not one surface with an alias. Two layers — control plane for AgentConnect, OpenAI-compatible
+inference for BrainConnect and direct applications — reaching one backend. Fully specified in §5.
+
+### D5 — Structural default-deny privacy enforcement — **RATIFIED**
+
+A hard architectural invariant: cloud providers are filtered out of the candidate set before
+placement, unknown/missing/local-only tiers yield no cloud candidates, and an empty set is a
+structured refusal — never a silent downgrade. Fully specified in §6. The `LocalRunRequest`
+amendment (CA-1) strengthens it but is not a prerequisite.
+
+### D6 — Apache-2.0 — **RATIFIED**
+
+The repository is licensed Apache-2.0 (`LICENSE`). Rationale: the explicit patent grant matters more
+for a compute control plane than for a memory ledger; it matches every infrastructure system
+ComputeConnect integrates with (Kubernetes, Ray, vLLM, containerd) and BrainConnect; and it is more
+appropriate for infrastructure than MIT.
 
 ---
 
-## 7. Validation: contract versus product value
+## 9. Validation: contract versus product value
 
 These are different claims, they fail differently, and conflating them is how a design doc gets to
 feel validated without being validated.
@@ -526,7 +662,7 @@ accelerator.**
 ### What would falsify the design
 
 * If AgentConnect's existing local-manager tests cannot be made to pass against a real
-  ComputeConnect serving the six endpoints, the contract in §5.1 was misread.
+  ComputeConnect serving the six endpoints, the contract in §7.1 was misread.
 * If, after building the capability normalizer, every value in it is already available from a single
   `nvidia-smi` or `ollama ps` call, then §4 is ceremony and llama-swap is the answer.
 * If a simulated second provider cannot be made to change a placement decision, the placement policy
