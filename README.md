@@ -4,9 +4,29 @@
 is capable of*, *whether it is healthy*, *whether a given model will fit on it*, and *where a
 workload should run*.
 
-ComputeConnect is **architecture and interfaces only**. There is no runtime, no server, and no
-code in this repository. Licensed **Apache-2.0** ([LICENSE](LICENSE)). See
-[docs/STATUS.md](docs/STATUS.md) before proposing work.
+As of **v0.1.0** there is a minimal runtime: the `computeconnect` package serves both API layers
+from one backend. Licensed **Apache-2.0** ([LICENSE](LICENSE)). See
+[docs/STATUS.md](docs/STATUS.md) — including its honest D2 re-evaluation — before proposing work.
+
+## Quickstart
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e .   # or: uv pip install -e .
+.venv/bin/computeconnect serve --port 8090 --upstream http://127.0.0.1:8080
+```
+
+* `--upstream` is an existing OpenAI-compatible llama.cpp server, consumed **read-only** —
+  ComputeConnect never starts, stops, loads, or unloads it.
+* Port 8090 by default (on the reference host, 8080 is the engine and 8787 is BrainConnect's).
+* Layer 1 (AgentConnect control plane): `GET /health`, `GET /models`, `GET /models/loaded`,
+  `POST /route/estimate`, `POST /generate` (streams; returns `X-Run-Id`),
+  `POST /runs/{run_id}/cancel`.
+* Layer 2 (OpenAI-compatible): `GET /v1/models`, `POST /v1/chat/completions`.
+* Privacy is structural: no `privacy_tier` means the most restrictive tier — cloud-class
+  providers are filtered before placement and refusals are structured, never silent downgrades.
+
+Tests: `.venv/bin/python -m pytest` (installs `pytest` via `pip install -e .[dev]`; real-engine
+tests skip when no llama.cpp is reachable on `:8080`).
 
 ---
 
@@ -63,17 +83,19 @@ ComputeConnect.
 
 ## Status at a glance
 
-Nothing runs. One compute node exists, and today it is described, not managed.
+A minimal runtime exists (v0.1.0). One real compute node exists; the second provider is
+simulated, and the heterogeneity premise is therefore still **unproven** — stated plainly in
+[STATUS.md](docs/STATUS.md).
 
 | Deliverable | State |
 |---|---|
 | Product boundaries | Drafted — [ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Contracts | Locked — [CONTRACT.md](docs/CONTRACT.md): two APIs, five binding invariants, amendments CA-1/CA-2 |
-| AgentConnect contract | **Already specified by AgentConnect**; ComputeConnect conforms. Ambiguities carried as CA-1/CA-2. |
-| BrainConnect contract | Drafted — a compute consumer on the inference API, not a peer scheduler |
+| Contracts | Locked — [CONTRACT.md](docs/CONTRACT.md): two APIs, five binding invariants; **CA-1 and CA-3 implemented**, CA-2 proposed |
+| AgentConnect contract | **Conformed to and tested with AgentConnect's shipped client**, including against the real local engine |
+| BrainConnect contract | Drafted — a compute consumer on the inference API, not a peer scheduler; nothing rewired yet |
 | ToolConnect contract | **Provisional** — validated runtime but no compute-facing surface yet |
-| Code | None. Intentionally. |
-| Decisions | **D1–D6 all ratified** — see [STATUS.md](docs/STATUS.md) |
+| Code | `computeconnect` 0.1.0: both API layers, structural privacy, streaming + cancellation, 64 tests |
+| Decisions | **D1–D6 all ratified** — implementation status per decision in [STATUS.md](docs/STATUS.md) |
 | License | **Apache-2.0** |
 
 ## The honest risk
