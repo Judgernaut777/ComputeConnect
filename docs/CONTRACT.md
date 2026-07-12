@@ -52,6 +52,11 @@ side-effect-free, and never touches a generation path. When ineligible, `reason`
 refusal `{code, detail, privacy, rejected[]}` — every filtered provider appears in `rejected` with
 the pipeline stage (`privacy | health | capability | model | context`) that removed it.
 
+Both control-plane tier-bearing routes (`/route/estimate` and `/generate`) also honor an
+`X-Privacy-Tier` request header with the **same** header/body precedence defined for Layer 2 below
+(more-restrictive-wins): a header can only narrow the body `privacy_tier`, never widen it. With no
+header present the behavior is body-only, unchanged.
+
 ### Layer 2 — Inference API (consumed by BrainConnect and direct applications)
 
 A standard **OpenAI-compatible** endpoint (`/v1/chat/completions` and friends). It is the standard
@@ -66,11 +71,15 @@ the `X-Privacy-Tier` request header (or a `privacy_tier` body extension); an imp
 yields a structured `403` refusal (`error.type = "privacy_refusal"`), never a silent downgrade.
 Responses carry an `X-Run-Id` header usable with `POST /runs/{run_id}/cancel`.
 
-**Privacy precedence (header vs body) — binding.** When *both* the `X-Privacy-Tier` header and a
+**Privacy precedence (header vs body) — binding, and identical on BOTH layers.** This rule governs
+**every** tier-bearing route — Layer 1's `/route/estimate` and `/generate` as well as Layer 2's
+`/v1/chat/completions`. When *both* the `X-Privacy-Tier` header and a
 body `privacy_tier` are present, the **more restrictive of the two** is enforced (strictness order
 is AgentConnect's `PRIVACY_STRICTNESS`: `public` < `public_redacted` < `repo_sensitive` <
 `local_only` < `secret_sensitive`). A header can therefore only ever **narrow** a body tier, never
-widen it — a permissive header cannot override a more-restrictive body. Rules:
+widen it — a permissive header cannot override a more-restrictive body. This means a gateway that
+stamps a stricter `X-Privacy-Tier` is honored even when an agent calls the control-plane routes
+directly; the header can only tighten, never loosen, residency. Rules:
 
 * neither present → most restrictive tier assumed (default deny);
 * exactly one present → that one;

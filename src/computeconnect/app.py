@@ -45,7 +45,7 @@ from .placement import (
     filter_candidates,
     select_placement,
 )
-from .privacy import ResolvedPrivacy, resolve_privacy_precedence, resolve_privacy_tier
+from .privacy import ResolvedPrivacy, resolve_privacy_precedence
 from .providers import ProviderRegistry, ProviderSpec
 from .runs import Run, RunJournal, RunRegistry
 
@@ -190,9 +190,6 @@ class ComputeConnectAPI:
 
     # ------------------------------------------------------------------ utils
 
-    async def _candidates(self, raw_tier: object) -> CandidateSet:
-        return await self._candidates_resolved(resolve_privacy_tier(raw_tier))
-
     async def _candidates_resolved(self, privacy: ResolvedPrivacy) -> CandidateSet:
         snapshots = await self.registry.snapshot()
         return filter_candidates(snapshots, privacy)
@@ -269,7 +266,15 @@ class ComputeConnectAPI:
             body = await request.json()
         except ValueError:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        candidates = await self._candidates(body.get("privacy_tier"))
+        # Same header/body precedence as the OpenAI layer (CONTRACT.md "Privacy
+        # precedence"): when both an X-Privacy-Tier header and a body
+        # privacy_tier are present the MORE RESTRICTIVE wins, so a gateway that
+        # stamps a stricter header can only narrow — never widen — the body
+        # tier. Absent header ⇒ body-only, identical to prior behavior.
+        privacy = resolve_privacy_precedence(
+            request.headers.get("x-privacy-tier"), body.get("privacy_tier")
+        )
+        candidates = await self._candidates_resolved(privacy)
         workload = WorkloadSpec(
             model=body.get("model") or None,
             required_capabilities=tuple(body.get("required_capabilities") or ()),
@@ -292,8 +297,15 @@ class ComputeConnectAPI:
 
         # CA-1: optional privacy_tier; absent means the most restrictive tier.
         # The candidate set is rebuilt here, so the chosen provider is
-        # positively re-verified against privacy at execution time.
-        candidates = await self._candidates(body.get("privacy_tier"))
+        # positively re-verified against privacy at execution time. As on the
+        # OpenAI layer, an X-Privacy-Tier header and the body privacy_tier are
+        # combined with more-restrictive-wins precedence (CONTRACT.md "Privacy
+        # precedence"): a stricter header narrows, never widens, the body tier.
+        # Absent header ⇒ body-only, identical to prior behavior.
+        privacy = resolve_privacy_precedence(
+            request.headers.get("x-privacy-tier"), body.get("privacy_tier")
+        )
+        candidates = await self._candidates_resolved(privacy)
         workload = WorkloadSpec(
             model=body.get("model") or None,
             max_output_tokens=int(body.get("max_output_tokens") or 0),
