@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — production hardening (2026-07-12)
+
+### Added
+
+* **Real heterogeneous placement across two REAL engines.** `scripts/second_engine.sh` stands up a
+  second real llama.cpp engine of a different shape (Qwen3-4B / 8k ctx on `:8091` vs the 30B MoE /
+  16k ctx on `:8080`). Placement now honors `latency_preference` (fastest node) and
+  `quality_preference` (highest node), with capability/context-window fit always winning over a soft
+  preference; `reason.considered` lists the candidate set. Demonstrated with real generations from
+  both engines and a real failover (see `docs/STATUS.md` D2 re-eval).
+* **Header/body privacy precedence** — when both `X-Privacy-Tier` and body `privacy_tier` are present
+  the **more restrictive** wins (a header can never widen a more-restrictive body). `PRIVACY_STRICTNESS`
+  byte-mirrors AgentConnect's, test-asserted. Fixes the Wave-earlier LOW finding.
+* **Durable run journal + restart reconciliation** (`--run-journal`): in-flight runs orphaned by a
+  crash are reconciled to terminal `interrupted` on restart, never lost or left `running`, and stay
+  queryable. `/health` reports `persistence`.
+* **Fail-closed staleness ceiling** (`max_snapshot_age`): a snapshot older than the bound is rejected
+  at a new `stale` stage rather than trusted; a stale snapshot can never cause a privacy-wrong cloud
+  placement.
+* **Declarative config surface** (`--config` / `COMPUTECONNECT_CONFIG`, JSON always, YAML via the
+  `config` extra) to declare providers without code; `docs/AGENTCONNECT_INTEGRATION.md` specifies the
+  AgentConnect-side `AGENTCONNECT_COMPUTE_URL` / `compute:` yaml shape (sibling-repo consumer change).
+
+### Tests
+
+* 66 → **109** passing: privacy precedence property tests (incl. conflicting header-vs-body),
+  preference + staleness placement, backpressure under a slow consumer, provider failover, run-journal
+  restart reconciliation over real HTTP, config surface, and two-real-engine placement/generation.
+
+### Docs
+
+* ADRs `docs/adr/0001`–`0004`; CONTRACT.md privacy-precedence + operational (persistence/staleness)
+  sections; STATUS.md D2 abandonment re-evaluation re-run against a real second engine.
+
 ## 0.1.0 — 2026-07-12
 
 First runtime. Everything before this release was documentation (Phase 0).

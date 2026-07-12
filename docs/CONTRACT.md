@@ -35,6 +35,16 @@ max_output_tokens, latency_preference, quality_preference}`.
 Output: `{eligible, selected_model, runtime, loaded, estimated_queue_seconds,
 estimated_tokens_per_second, estimated_quality, reason}`.
 
+`latency_preference` and `quality_preference` are **honored** as of this hardening pass: a
+`latency_preference` in `{low, low_latency, lowest, fast, fastest, interactive, latency}` selects the
+fastest eligible node, a `quality_preference` in `{high, highest, best, max, quality}` selects the
+highest-quality one, and hard constraints (capability, context-window fit) always win over a soft
+preference. This is what lets placement choose between two same-class nodes (e.g. a small fast model
+and a large accurate one) for a reason a static request router cannot see. `reason` now also carries
+a `considered` array — every eligible provider with its declared tps/quality/queue — so the choice is
+auditable. With no preference, the historical ordering (local class first, then loaded model, then
+shortest queue, then provider id) is unchanged.
+
 v0.1.0 defines the previously-underdefined `estimated_quality` as an operator-declared heuristic
 in `[0, 1]`, comparable only within one ComputeConnect deployment (ambiguity (4), ARCHITECTURE
 §7.1). `/route/estimate` is served from a TTL-cached provider snapshot: it is cheap,
@@ -55,6 +65,18 @@ is assumed and cloud-class providers are not candidates. A caller may supply an 
 the `X-Privacy-Tier` request header (or a `privacy_tier` body extension); an impermissible model
 yields a structured `403` refusal (`error.type = "privacy_refusal"`), never a silent downgrade.
 Responses carry an `X-Run-Id` header usable with `POST /runs/{run_id}/cancel`.
+
+**Privacy precedence (header vs body) — binding.** When *both* the `X-Privacy-Tier` header and a
+body `privacy_tier` are present, the **more restrictive of the two** is enforced (strictness order
+is AgentConnect's `PRIVACY_STRICTNESS`: `public` < `public_redacted` < `repo_sensitive` <
+`local_only` < `secret_sensitive`). A header can therefore only ever **narrow** a body tier, never
+widen it — a permissive header cannot override a more-restrictive body. Rules:
+
+* neither present → most restrictive tier assumed (default deny);
+* exactly one present → that one;
+* both present → the stricter; conflicting or malformed values fail **closed** (a present-but-garbage
+  value resolves to the most restrictive tier and wins). An empty/whitespace `X-Privacy-Tier:` header
+  is treated as *absent* so it cannot silently fail-close a valid body tier.
 
 Model-resolution errors distinguish three cases so an OpenAI client can react correctly:
 
@@ -167,6 +189,36 @@ one delta at a time; cancellation (via CA-3 or client disconnect) closes the ups
 mid-generation.
 
 ---
+
+## Operational behavior (production hardening)
+
+These are behavioral guarantees the runtime now makes. They do not change the wire shape.
+
+### Runs: persistence and restart
+
+`GET /runs/{run_id}` and `POST /runs/{run_id}/cancel` are backed by an **optional durable run
+journal** (`--run-journal PATH` / `run_journal_path`; SQLite). When enabled:
+
+* every run is recorded at creation and at completion;
+* on the **next start**, any run left in the non-terminal `running` state by a crash is reconciled to
+  the terminal state **`interrupted`** — never left dangling as `running`, never lost;
+* a reconciled run stays queryable via `GET /runs/{run_id}`, so a client distinguishes
+  *"a restart interrupted your in-flight run — retry"* (`state = "interrupted"`) from *"no such run"*
+  (`404`). Cancelling a reconciled run returns `already_finished`.
+
+ComputeConnect is a thin proxy and holds no resumable generation state, so an interrupted run is
+**not** resumed — the contract is that it is accounted for, not that it continues. `/health` reports
+`persistence: {run_journal, reconciled_runs_on_start}`. With no journal configured the registry is
+pure in-memory (the historical behavior) and in-flight runs simply vanish on restart.
+
+### Capacity/health staleness
+
+`/route/estimate` and placement read a TTL-cached provider snapshot. A **fail-closed staleness
+ceiling** (`max_snapshot_age`, default a generous multiple of the snapshot TTL) means a snapshot
+older than the ceiling is rejected at a new `stale` pipeline stage rather than trusted, so
+grossly-stale capacity/health can never drive a placement. Because privacy filtering is structural
+(on `placement_class`, not on health), **a stale snapshot can never cause a privacy-wrong cloud
+placement** — the cloud provider was removed before staleness was ever considered.
 
 ## Provisional / not yet contracted
 
