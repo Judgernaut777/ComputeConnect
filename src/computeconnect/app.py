@@ -57,6 +57,20 @@ _DONE = object()
 class AppConfig:
     providers: list[ProviderSpec] = field(default_factory=list)
     snapshot_ttl: float = 5.0
+    #: Fail-closed staleness ceiling (seconds) for placement. A cached snapshot
+    #: older than this is treated as unavailable rather than trusted, so
+    #: grossly-stale capacity/health never drives a placement. ``None`` disables
+    #: the ceiling (a snapshot is only ever as old as ``snapshot_ttl`` anyway,
+    #: since ``snapshot()`` refreshes past the TTL). The default is a generous
+    #: multiple of the TTL: a real backstop, not something that fires normally.
+    max_snapshot_age: float | None = None
+
+    def effective_max_snapshot_age(self) -> float | None:
+        if self.max_snapshot_age is not None:
+            return self.max_snapshot_age
+        if self.snapshot_ttl <= 0:
+            return None  # TTL 0 = always re-probe; a ceiling would be meaningless
+        return max(self.snapshot_ttl * 6.0, self.snapshot_ttl + 30.0)
 
 
 def build_default_config(
@@ -159,6 +173,7 @@ class ComputeConnectAPI:
         self.registry = ProviderRegistry(
             config.providers, self.runs, snapshot_ttl=config.snapshot_ttl
         )
+        self._max_snapshot_age = config.effective_max_snapshot_age()
 
     # ------------------------------------------------------------------ utils
 
@@ -243,8 +258,12 @@ class ComputeConnectAPI:
             required_capabilities=tuple(body.get("required_capabilities") or ()),
             context_tokens=int(body.get("context_tokens") or 0),
             max_output_tokens=int(body.get("max_output_tokens") or 0),
+            latency_preference=str(body.get("latency_preference") or "normal"),
+            quality_preference=str(body.get("quality_preference") or "good_enough"),
         )
-        return JSONResponse(estimate(candidates, workload))
+        return JSONResponse(
+            estimate(candidates, workload, max_snapshot_age=self._max_snapshot_age)
+        )
 
     async def generate(self, request: Request) -> Response:
         try:
@@ -261,8 +280,13 @@ class ComputeConnectAPI:
         workload = WorkloadSpec(
             model=body.get("model") or None,
             max_output_tokens=int(body.get("max_output_tokens") or 0),
+            context_tokens=int(body.get("context_tokens") or 0),
+            latency_preference=str(body.get("latency_preference") or "normal"),
+            quality_preference=str(body.get("quality_preference") or "good_enough"),
         )
-        outcome = select_placement(candidates, workload)
+        outcome = select_placement(
+            candidates, workload, max_snapshot_age=self._max_snapshot_age
+        )
         if isinstance(outcome, PlacementRefusal):
             return JSONResponse(
                 {
@@ -416,7 +440,15 @@ class ComputeConnectAPI:
             request.headers.get("x-privacy-tier"), body.get("privacy_tier")
         )
         candidates = await self._candidates_resolved(privacy)
-        outcome = select_placement(candidates, WorkloadSpec(model=str(model_name)))
+        outcome = select_placement(
+            candidates,
+            WorkloadSpec(
+                model=str(model_name),
+                latency_preference=str(body.get("latency_preference") or "normal"),
+                quality_preference=str(body.get("quality_preference") or "good_enough"),
+            ),
+            max_snapshot_age=self._max_snapshot_age,
+        )
         if isinstance(outcome, PlacementRefusal):
             known_anywhere = any(
                 model_name == m.id for s in await self.registry.snapshot() for m in s.models
