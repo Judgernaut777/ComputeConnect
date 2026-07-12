@@ -23,6 +23,8 @@ from computeconnect.privacy import (
     CLOUD_PERMITTING_TIERS,
     KNOWN_TIERS,
     MOST_RESTRICTIVE_TIER,
+    PRIVACY_STRICTNESS,
+    resolve_privacy_precedence,
     resolve_privacy_tier,
 )
 from computeconnect.providers import ProviderSnapshot, ProviderSpec
@@ -167,6 +169,103 @@ class TestStructuralFiltering:
         assert result["reason"]["code"] == "no_compliant_provider"
         assert isinstance(result["reason"]["rejected"], list)
 
+class TestPrivacyPrecedence:
+    """Deliverable 3 + 2: header/body precedence is unambiguous (more
+    restrictive wins) and default-deny survives conflicting inputs."""
+
+    def test_strictness_mirror_matches_agentconnect(self):
+        """Our strictness order must byte-mirror AgentConnect's, or the
+        precedence rule silently disagrees with what routing enforced."""
+        import sys
+        from pathlib import Path
+
+        src = Path("/home/mini/mcp-agentconnect/packages/agentconnect-core/src")
+        if not src.is_dir():
+            import pytest
+
+            pytest.skip("mcp-agentconnect checkout not available")
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
+        from agentconnect.core.models import PRIVACY_STRICTNESS as AC
+
+        assert PRIVACY_STRICTNESS == {t.value: rank for t, rank in AC.items()}
+
+    def test_no_signal_is_default_deny(self):
+        r = resolve_privacy_precedence()
+        assert r.effective == MOST_RESTRICTIVE_TIER
+        assert r.assumed is True
+        assert r.cloud_permitted is False
+        # Absent header + absent body key both arrive as None.
+        r2 = resolve_privacy_precedence(None, None)
+        assert r2.cloud_permitted is False and r2.assumed is True
+
+    def test_empty_or_whitespace_signals_do_not_clobber_a_real_one(self):
+        # An empty X-Privacy-Tier header must not narrow a valid body tier.
+        r = resolve_privacy_precedence("", "public")
+        assert r.effective == "public" and r.cloud_permitted is True
+        r = resolve_privacy_precedence("   ", "public")
+        assert r.cloud_permitted is True
+        # ...and with only an empty header, it is still default-deny.
+        assert resolve_privacy_precedence("", None).cloud_permitted is False
+
+    def test_single_signal_from_either_channel(self):
+        assert resolve_privacy_precedence("public", None).cloud_permitted is True
+        assert resolve_privacy_precedence(None, "public").cloud_permitted is True
+        assert resolve_privacy_precedence("local_only", None).cloud_permitted is False
+
+    def test_header_cannot_widen_a_more_restrictive_body(self):
+        """The exact LOW finding: a permissive header must not override a
+        more-restrictive body."""
+        r = resolve_privacy_precedence("public", "local_only")  # header, body
+        assert r.effective == "local_only"
+        assert r.cloud_permitted is False
+        # And symmetrically, a permissive body cannot widen a restrictive header.
+        r = resolve_privacy_precedence("secret_sensitive", "public")
+        assert r.effective == "secret_sensitive"
+        assert r.cloud_permitted is False
+
+    def test_more_restrictive_wins_regardless_of_argument_order(self):
+        a = resolve_privacy_precedence("public", "repo_sensitive")
+        b = resolve_privacy_precedence("repo_sensitive", "public")
+        assert a.effective == b.effective == "repo_sensitive"
+        assert a.cloud_permitted is b.cloud_permitted is False
+
+    def test_both_permissive_permits_cloud(self):
+        r = resolve_privacy_precedence("public", "public_redacted")
+        assert r.cloud_permitted is True
+        assert r.effective == "public_redacted"  # the stricter of the two
+
+    def test_garbage_present_signal_fails_closed_against_a_valid_one(self):
+        # A present-but-garbage signal resolves to most-restrictive and wins.
+        for garbage in ("definitely-not-a-tier", 123, {"tier": "public"}, ["public"]):
+            r = resolve_privacy_precedence(garbage, "public")
+            assert r.cloud_permitted is False, garbage
+            assert r.effective == MOST_RESTRICTIVE_TIER, garbage
+
+    def test_conflicting_inputs_property_never_widen_cloud(self):
+        """Property: for every (header, body) pair, the precedence result is
+        never *more* permissive than the strictest cloud-permitting single
+        input would allow. Cloud is permitted only if BOTH resolve to a
+        cloud-permitting tier."""
+        signals = list(NON_PERMITTING_INPUTS) + ["public", "public_redacted", "public "]
+        for h in signals:
+            for b in signals:
+                r = resolve_privacy_precedence(h, b)
+                rh, rb = resolve_privacy_tier(h), resolve_privacy_tier(b)
+                # cloud permitted iff every *supplied* channel permits it.
+                from computeconnect.privacy import _supplied
+
+                supplied = [x for x in (h, b) if _supplied(x)]
+                if not supplied:
+                    expect = False
+                else:
+                    expect = all(
+                        resolve_privacy_tier(x).cloud_permitted for x in supplied
+                    )
+                assert r.cloud_permitted is expect, (h, b)
+
+
+class TestStructuralFilteringSig:
     def test_pipeline_is_structural_by_signature(self):
         """Placement and estimate accept only a CandidateSet — the type that
         exists solely as the output of the privacy filter. There is no

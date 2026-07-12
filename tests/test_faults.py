@@ -134,6 +134,72 @@ def test_openai_dead_cloud_model_not_leaked_under_restrictive_tier(stack):
         stack.sim.fail_health = False
 
 
+def test_openai_header_cannot_widen_more_restrictive_body(stack):
+    """Deliverable 3, end to end: a permissive X-Privacy-Tier header must NOT
+    override a more-restrictive body privacy_tier on a cloud model."""
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        headers={"X-Privacy-Tier": "public"},
+        json={
+            "model": "sim-cloud-large",
+            "messages": [{"role": "user", "content": "x"}],
+            "privacy_tier": "local_only",
+        },
+        timeout=15,
+    )
+    assert resp.status_code == 403  # body wins: cloud forbidden
+    assert resp.json()["error"]["type"] == "privacy_refusal"
+    assert stack.sim.chat_requests == 0  # never reached the cloud engine
+
+
+def test_openai_body_cannot_widen_more_restrictive_header(stack):
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        headers={"X-Privacy-Tier": "secret_sensitive"},
+        json={
+            "model": "sim-cloud-large",
+            "messages": [{"role": "user", "content": "x"}],
+            "privacy_tier": "public",
+        },
+        timeout=15,
+    )
+    assert resp.status_code == 403
+    assert stack.sim.chat_requests == 0
+
+
+def test_openai_both_permissive_reaches_cloud(stack):
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        headers={"X-Privacy-Tier": "public"},
+        json={
+            "model": "sim-cloud-large",
+            "messages": [{"role": "user", "content": "x"}],
+            "privacy_tier": "public_redacted",
+            "max_tokens": 4,
+        },
+        timeout=15,
+    )
+    assert resp.status_code == 200
+    assert stack.sim.chat_requests == 1
+
+
+def test_openai_empty_header_does_not_clobber_permissive_body(stack):
+    """An empty X-Privacy-Tier header must not fail-close a valid body tier."""
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        headers={"X-Privacy-Tier": ""},
+        json={
+            "model": "sim-cloud-large",
+            "messages": [{"role": "user", "content": "x"}],
+            "privacy_tier": "public",
+            "max_tokens": 4,
+        },
+        timeout=15,
+    )
+    assert resp.status_code == 200
+    assert stack.sim.chat_requests == 1
+
+
 def test_estimate_never_500s_on_malformed_body(stack):
     resp = httpx.post(
         f"{stack.base_url}/route/estimate",

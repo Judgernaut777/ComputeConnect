@@ -45,7 +45,7 @@ from .placement import (
     filter_candidates,
     select_placement,
 )
-from .privacy import resolve_privacy_tier
+from .privacy import ResolvedPrivacy, resolve_privacy_precedence, resolve_privacy_tier
 from .providers import ProviderRegistry, ProviderSpec
 from .runs import Run, RunRegistry
 
@@ -163,7 +163,9 @@ class ComputeConnectAPI:
     # ------------------------------------------------------------------ utils
 
     async def _candidates(self, raw_tier: object) -> CandidateSet:
-        privacy = resolve_privacy_tier(raw_tier)
+        return await self._candidates_resolved(resolve_privacy_tier(raw_tier))
+
+    async def _candidates_resolved(self, privacy: ResolvedPrivacy) -> CandidateSet:
         snapshots = await self.registry.snapshot()
         return filter_candidates(snapshots, privacy)
 
@@ -406,9 +408,14 @@ class ComputeConnectAPI:
             )
 
         # Same structural privacy path as the control plane: no tier means the
-        # most restrictive tier; cloud is filtered before placement.
-        raw_tier = request.headers.get("x-privacy-tier", body.get("privacy_tier"))
-        candidates = await self._candidates(raw_tier)
+        # most restrictive tier; cloud is filtered before placement. When BOTH
+        # the X-Privacy-Tier header and a body privacy_tier are present, the
+        # MORE RESTRICTIVE of the two wins — a header can never widen a
+        # more-restrictive body (CONTRACT.md "Privacy precedence").
+        privacy = resolve_privacy_precedence(
+            request.headers.get("x-privacy-tier"), body.get("privacy_tier")
+        )
+        candidates = await self._candidates_resolved(privacy)
         outcome = select_placement(candidates, WorkloadSpec(model=str(model_name)))
         if isinstance(outcome, PlacementRefusal):
             known_anywhere = any(
