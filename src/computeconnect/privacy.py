@@ -29,6 +29,20 @@ KNOWN_TIERS = frozenset(
 #: AgentConnect's PRIVACY_STRICTNESS ordering.
 MOST_RESTRICTIVE_TIER = "secret_sensitive"
 
+#: Strictness order, loosest first — a byte-for-byte mirror of AgentConnect's
+#: ``agentconnect.core.models.PRIVACY_STRICTNESS`` (loosest ``public`` = 0,
+#: strictest ``secret_sensitive`` = 4). Used only to compare two *resolved*
+#: tiers when a caller supplies more than one privacy signal (header + body):
+#: the **more restrictive** one wins, so a header can never widen a
+#: more-restrictive body (CONTRACT.md "Privacy precedence").
+PRIVACY_STRICTNESS = {
+    "public": 0,
+    "public_redacted": 1,
+    "repo_sensitive": 2,
+    "local_only": 3,
+    "secret_sensitive": 4,
+}
+
 
 @dataclass(frozen=True)
 class ResolvedPrivacy:
@@ -81,3 +95,50 @@ def resolve_privacy_tier(raw: object) -> ResolvedPrivacy:
         assumed=False,
         cloud_permitted=tier in CLOUD_PERMITTING_TIERS,
     )
+
+
+def _strictness(resolved: ResolvedPrivacy) -> int:
+    """Strictness rank of a *resolved* tier. Any tier not in the map (there
+    should be none, since ``resolve_privacy_tier`` only ever emits known tiers)
+    ranks as the most restrictive — fail closed."""
+    return PRIVACY_STRICTNESS.get(
+        resolved.effective, PRIVACY_STRICTNESS[MOST_RESTRICTIVE_TIER]
+    )
+
+
+def _supplied(raw: object) -> bool:
+    """True when a caller actually supplied a privacy signal.
+
+    A ``None`` (absent header, absent body key) or an empty/whitespace string
+    (an empty ``X-Privacy-Tier:`` header) is treated as *not supplied*, so it
+    never clobbers a genuine value from the other channel. A non-string,
+    non-None value (``123``, a dict) IS supplied — it is garbage, and garbage
+    must fail closed rather than be silently ignored.
+    """
+    if raw is None:
+        return False
+    if isinstance(raw, str) and not raw.strip():
+        return False
+    return True
+
+
+def resolve_privacy_precedence(*raw_inputs: object) -> ResolvedPrivacy:
+    """Resolve several privacy signals (e.g. an ``X-Privacy-Tier`` header and a
+    body ``privacy_tier``) into one, taking the **more restrictive**.
+
+    Precedence rules (CONTRACT.md "Privacy precedence"):
+
+    * No signal supplied → most restrictive tier, assumed (default deny).
+    * Exactly one supplied → that one, resolved normally.
+    * Two or more supplied → each is resolved independently and the strictest
+      resolved tier wins. A header can therefore only ever *narrow* a body
+      tier, never widen it; conflicting or malformed inputs fail closed.
+
+    Order of ``raw_inputs`` is irrelevant to the outcome (it is a max over
+    strictness); it only breaks exact ties, which are indistinguishable anyway.
+    """
+    supplied = [r for r in raw_inputs if _supplied(r)]
+    if not supplied:
+        return resolve_privacy_tier(None)
+    resolved = [resolve_privacy_tier(r) for r in supplied]
+    return max(resolved, key=_strictness)
