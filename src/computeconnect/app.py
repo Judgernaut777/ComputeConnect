@@ -47,7 +47,7 @@ from .placement import (
 )
 from .privacy import ResolvedPrivacy, resolve_privacy_precedence, resolve_privacy_tier
 from .providers import ProviderRegistry, ProviderSpec
-from .runs import Run, RunRegistry
+from .runs import Run, RunJournal, RunRegistry
 
 _CANCELLED = object()
 _DONE = object()
@@ -64,6 +64,11 @@ class AppConfig:
     #: since ``snapshot()`` refreshes past the TTL). The default is a generous
     #: multiple of the TTL: a real backstop, not something that fires normally.
     max_snapshot_age: float | None = None
+    #: Optional path to a SQLite run journal. When set, runs are persisted and,
+    #: on the next start, any run left ``running`` by a crash is reconciled to
+    #: the terminal ``interrupted`` state (never lost, never dangling). ``None``
+    #: keeps the historical pure in-memory registry.
+    run_journal_path: str | None = None
 
     def effective_max_snapshot_age(self) -> float | None:
         if self.max_snapshot_age is not None:
@@ -78,6 +83,7 @@ def build_default_config(
     *,
     include_sim_cloud: bool = True,
     snapshot_ttl: float = 5.0,
+    run_journal_path: str | None = None,
 ) -> AppConfig:
     """Local llama.cpp (read-only upstream) plus the simulated cloud provider."""
     providers = [
@@ -103,7 +109,11 @@ def build_default_config(
                 estimated_tokens_per_second=80.0,
             )
         )
-    return AppConfig(providers=providers, snapshot_ttl=snapshot_ttl)
+    return AppConfig(
+        providers=providers,
+        snapshot_ttl=snapshot_ttl,
+        run_journal_path=run_journal_path,
+    )
 
 
 class UpstreamStream:
@@ -169,7 +179,10 @@ class UpstreamStream:
 class ComputeConnectAPI:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self.runs = RunRegistry()
+        self.journal = (
+            RunJournal(config.run_journal_path) if config.run_journal_path else None
+        )
+        self.runs = RunRegistry(journal=self.journal)
         self.registry = ProviderRegistry(
             config.providers, self.runs, snapshot_ttl=config.snapshot_ttl
         )
@@ -209,6 +222,10 @@ class ComputeConnectAPI:
                 "status": status,
                 "service": "computeconnect",
                 "version": __version__,
+                "persistence": {
+                    "run_journal": bool(self.journal),
+                    "reconciled_runs_on_start": len(self.runs.reconciled_run_ids),
+                },
                 "providers": {
                     s.spec.id: {
                         "healthy": s.healthy,
