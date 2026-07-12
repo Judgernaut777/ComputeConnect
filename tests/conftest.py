@@ -35,6 +35,14 @@ class FakeLlamaUpstream:
     def __init__(self) -> None:
         self.token_delay = 0.02
         self.response_tokens = 8
+        #: Bytes of padding appended to each token — used to force real TCP
+        #: backpressure (a slow consumer can only be paced if the in-flight
+        #: bytes exceed the socket/uvicorn buffers).
+        self.token_bytes = 0
+        #: Count of token bodies whose ``send`` has RETURNED. If the downstream
+        #: is paced, this cannot reach ``response_tokens`` while the client is
+        #: not reading.
+        self.sent_tokens = 0
         self.chat_requests = 0
         self.health_requests = 0
         self.models_requests = 0
@@ -126,7 +134,8 @@ class FakeLlamaUpstream:
                 if disconnected.is_set():
                     self.disconnects += 1
                     return
-                chunk = {"choices": [{"index": 0, "delta": {"content": f"tok{i} "}}]}
+                content = f"tok{i} " + ("x" * self.token_bytes)
+                chunk = {"choices": [{"index": 0, "delta": {"content": content}}]}
                 await send(
                     {
                         "type": "http.response.body",
@@ -134,6 +143,9 @@ class FakeLlamaUpstream:
                         "more_body": True,
                     }
                 )
+                # This send has returned: the byte left our buffer only because
+                # the downstream made room. Under backpressure it blocks here.
+                self.sent_tokens += 1
             await send(
                 {"type": "http.response.body", "body": b"data: [DONE]\n\n", "more_body": False}
             )

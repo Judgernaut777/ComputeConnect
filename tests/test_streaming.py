@@ -52,6 +52,51 @@ def test_generate_streams_incrementally_not_buffered(stack):
     assert document["warnings"] == []
 
 
+def test_generate_backpressure_paces_upstream_to_a_slow_consumer(stack):
+    """Deliverable 4: a slow /generate consumer must pace the upstream engine.
+
+    The upstream is asked for 400 tokens of 128 KB each (~51 MB) with no delay,
+    far more than the pipeline's in-flight buffers hold (~18 MB, measured). We
+    read the first couple of tokens, then stop reading for a second. If
+    ComputeConnect propagated backpressure (one-delta pull + TCP), the upstream
+    cannot have sent all 400 tokens while we were not reading — it blocks
+    partway. Then we drain the rest and the document still completes cleanly.
+    """
+    stack.upstream.response_tokens = 400
+    stack.upstream.token_bytes = 128 * 1024
+    stack.upstream.token_delay = 0.0
+    with httpx.Client(timeout=60) as client:
+        with client.stream(
+            "POST",
+            f"{stack.base_url}/generate",
+            json={"prompt": "backpressure", "task_type": "general"},
+        ) as resp:
+            assert resp.status_code == 200
+            it = resp.iter_raw(chunk_size=16 * 1024)
+            # Read a little — enough to get past the JSON prefix and a token.
+            for _ in range(3):
+                next(it)
+            # Now stop reading and let the pipeline fill and block.
+            time.sleep(1.0)
+            paced = stack.upstream.sent_tokens
+            assert 1 <= paced < stack.upstream.response_tokens, (
+                f"upstream sent {paced}/{stack.upstream.response_tokens} tokens "
+                "with a stalled consumer: backpressure was NOT propagated"
+            )
+            # Re-check after another idle beat: it must stay blocked, not creep on.
+            time.sleep(0.5)
+            assert stack.upstream.sent_tokens == paced, (
+                "upstream kept producing while the consumer was idle: "
+                "backpressure did not hold"
+            )
+            # Drain the rest; the response still completes.
+            for _ in it:
+                pass
+    # Upstream eventually delivered everything once we resumed reading.
+    assert stack.upstream.sent_tokens == stack.upstream.response_tokens
+    assert stack.upstream.completed == 1
+
+
 def test_generate_response_parses_as_local_run_result(stack):
     """A non-streaming reader (AgentConnect's shipped client) sees valid JSON
     with the LocalRunResult fields plus the run-id amendment."""
