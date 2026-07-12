@@ -245,6 +245,73 @@ def test_openai_empty_header_does_not_clobber_permissive_body(stack):
     assert stack.sim.chat_requests == 1
 
 
+def test_failover_to_surviving_provider_when_one_dies(stack, upstream_server):
+    """Deliverable 4 (failover): kill provider A (local), and a placement moves
+    to the surviving provider B when the tier permits it."""
+    _, upstream_handle = upstream_server
+    httpx.get(f"{stack.base_url}/models", timeout=10)  # prime both healthy
+    upstream_handle.stop()  # provider A goes down
+    resp = httpx.post(
+        f"{stack.base_url}/generate",
+        json={
+            "prompt": "hi",
+            "task_type": "general",
+            "privacy_tier": "public",
+            "max_output_tokens": 4,
+        },
+        timeout=30,
+    )
+    body = resp.json()
+    assert body["status"] == "succeeded"
+    assert body["runtime"] == "simulated-cloud"  # failed over from local to B
+    assert stack.sim.chat_requests == 1
+
+
+def test_failover_refuses_when_survivor_is_privacy_forbidden(stack, upstream_server):
+    """The other half of the deliverable: when the only survivor is a cloud
+    provider the tier forbids, placement REFUSES — never a silent downgrade."""
+    _, upstream_handle = upstream_server
+    httpx.get(f"{stack.base_url}/models", timeout=10)
+    upstream_handle.stop()  # only the cloud provider remains
+    resp = httpx.post(
+        f"{stack.base_url}/generate",
+        json={"prompt": "hi", "task_type": "general", "privacy_tier": "local_only"},
+        timeout=30,
+    )
+    body = resp.json()
+    assert body["status"] == "refused"
+    assert body["refusal"]["code"] == "no_compliant_provider"
+    assert stack.sim.chat_requests == 0  # cloud never silently used
+
+
+def test_midflight_provider_failure_then_failover_on_retry(stack):
+    """Provider B (cloud) fails mid-generation → reported 'failed', not a crash;
+    a retry places on the surviving provider A (local)."""
+    stack.sim.fail_after_tokens = 2
+    r1 = httpx.post(
+        f"{stack.base_url}/generate",
+        json={
+            "model": "sim-cloud-large",
+            "task_type": "general",
+            "prompt": "hi",
+            "privacy_tier": "public",
+        },
+        timeout=30,
+    )
+    assert r1.json()["status"] == "failed"
+    # Retry unpinned under the default tier: the local engine serves it.
+    r2 = httpx.post(
+        f"{stack.base_url}/generate",
+        json={"prompt": "hi", "task_type": "general", "max_output_tokens": 4},
+        timeout=30,
+    )
+    b2 = r2.json()
+    assert b2["status"] == "succeeded"
+    assert b2["runtime"] == "llama.cpp"
+    # Service is fully healthy throughout.
+    assert httpx.get(f"{stack.base_url}/health", timeout=10).status_code == 200
+
+
 def test_estimate_never_500s_on_malformed_body(stack):
     resp = httpx.post(
         f"{stack.base_url}/route/estimate",
