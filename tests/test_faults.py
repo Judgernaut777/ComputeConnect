@@ -2,7 +2,52 @@
 
 from __future__ import annotations
 
+import time
+
 import httpx
+
+from computeconnect.app import AppConfig, create_app
+from computeconnect.engines import LlamaCppEngine
+from computeconnect.providers import ProviderSpec
+
+from conftest import ServerHandle
+
+
+def test_service_level_stale_snapshot_refuses(upstream_server):
+    """Deliverable 5, over real HTTP: with a long TTL (so the cache is not
+    refreshed) and a short staleness ceiling, a placement made after the
+    ceiling elapses is fail-closed — refused at the 'stale' stage rather than
+    served from grossly-stale capacity."""
+    _, upstream_handle = upstream_server
+    cfg = AppConfig(
+        providers=[
+            ProviderSpec(
+                id="local-llamacpp",
+                placement_class="local",
+                engine=LlamaCppEngine(upstream_handle.base_url),
+                capabilities=("generate",),
+            )
+        ],
+        snapshot_ttl=3600.0,  # effectively never auto-refresh during the test
+        max_snapshot_age=0.5,  # but trust a snapshot for only 0.5s
+    )
+    handle = ServerHandle(create_app(cfg)).start()
+    try:
+        body = {"task_type": "general", "privacy_tier": "local_only"}
+        fresh = httpx.post(
+            f"{handle.base_url}/route/estimate", json=body, timeout=10
+        ).json()
+        assert fresh["eligible"] is True  # primed, snapshot is fresh
+        time.sleep(0.7)  # exceed the 0.5s ceiling; TTL keeps the cache stale
+        stale = httpx.post(
+            f"{handle.base_url}/route/estimate", json=body, timeout=10
+        ).json()
+        assert stale["eligible"] is False
+        assert any(r["stage"] == "stale" for r in stale["reason"]["rejected"])
+        # And the service is still perfectly alive.
+        assert httpx.get(f"{handle.base_url}/health", timeout=10).status_code == 200
+    finally:
+        handle.stop()
 
 
 def test_upstream_down_health_is_degraded_not_error(stack_upstream_down):

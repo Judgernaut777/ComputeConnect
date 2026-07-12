@@ -20,6 +20,7 @@ machine-readable reason: a structured refusal, never a silent downgrade
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from .engines import ModelInfo
@@ -28,6 +29,13 @@ from .providers import ProviderSnapshot
 
 #: Seconds of queue estimated per run already waiting beyond capacity.
 _QUEUE_SECONDS_PER_BACKLOGGED_RUN = 30.0
+
+#: Latency-preference strings that ask for the fastest eligible node.
+_LOW_LATENCY = frozenset(
+    {"low", "low_latency", "lowest", "fast", "fastest", "interactive", "latency"}
+)
+#: Quality-preference strings that ask for the highest-quality eligible node.
+_HIGH_QUALITY = frozenset({"high", "highest", "best", "max", "quality"})
 
 
 @dataclass(frozen=True)
@@ -117,6 +125,14 @@ class WorkloadSpec:
     required_capabilities: tuple[str, ...] = ()
     context_tokens: int = 0
     max_output_tokens: int = 0
+    #: Soft placement hints. ``latency_preference`` in _LOW_LATENCY picks the
+    #: fastest eligible node; ``quality_preference`` in _HIGH_QUALITY picks the
+    #: highest-quality one. This is how a *real* heterogeneous placement chooses
+    #: between two same-class nodes (e.g. a small fast model vs a large accurate
+    #: one) for a reason a static request router cannot see. Defaults keep the
+    #: historical local-first / loaded / shortest-queue ordering.
+    latency_preference: str = "normal"
+    quality_preference: str = "good_enough"
     metadata: dict = field(default_factory=dict)
 
 
@@ -128,19 +144,44 @@ def _queue_seconds(snap: ProviderSnapshot) -> float:
 
 
 def select_placement(
-    candidates: CandidateSet, workload: WorkloadSpec
+    candidates: CandidateSet,
+    workload: WorkloadSpec,
+    *,
+    now: float | None = None,
+    max_snapshot_age: float | None = None,
 ) -> Placement | PlacementRefusal:
-    """Stages 2..n — health, model match, capability, and context fit.
+    """Stages 2..n — staleness, health, model match, capability, context fit.
 
-    Preference among eligible providers: local placement class first, then
-    loaded model, then the shortest queue. Deterministic; ties broken by
-    registration order.
+    Default preference among eligible providers: local placement class first,
+    then loaded model, then the shortest queue. When the workload expresses a
+    ``latency_preference`` (fastest) or ``quality_preference`` (highest), that
+    reorders the same-class candidates — this is what makes a real
+    heterogeneous placement pick one node over another. Deterministic; ties
+    broken by provider id.
+
+    ``max_snapshot_age`` is a fail-closed staleness ceiling: a candidate whose
+    cached health/capacity snapshot is older than this bound is rejected at the
+    ``stale`` stage rather than trusted, so grossly-stale capacity can never
+    cause a placement — and, because privacy filtering already ran structurally
+    on ``placement_class`` (not on health), a stale snapshot can never cause a
+    privacy-wrong cloud placement either.
     """
+    now = time.time() if now is None else now
     rejections: list[Rejection] = list(candidates.rejections)
     eligible: list[tuple[ProviderSnapshot, ModelInfo]] = []
 
     for snap in candidates.candidates:
         pid = snap.spec.id
+        if max_snapshot_age is not None and (now - snap.taken_at) > max_snapshot_age:
+            rejections.append(
+                Rejection(
+                    pid,
+                    "stale",
+                    f"snapshot {now - snap.taken_at:.1f}s old exceeds "
+                    f"{max_snapshot_age:.1f}s ceiling; treated as unavailable",
+                )
+            )
+            continue
         if not snap.healthy:
             rejections.append(Rejection(pid, "health", snap.detail))
             continue
@@ -184,13 +225,24 @@ def select_placement(
             detail="no provider satisfies privacy, health, capability, and fit constraints",
         )
 
-    eligible.sort(
-        key=lambda pair: (
-            pair[0].spec.placement_class != "local",  # local first
-            not pair[1].loaded,
-            _queue_seconds(pair[0]),
-        )
-    )
+    want_fast = str(workload.latency_preference or "").lower() in _LOW_LATENCY
+    want_quality = str(workload.quality_preference or "").lower() in _HIGH_QUALITY
+
+    def _rank(pair: tuple[ProviderSnapshot, ModelInfo]) -> tuple:
+        snap, model = pair
+        spec = snap.spec
+        local_first = spec.placement_class != "local"  # local before cloud, always
+        if want_quality:
+            pref: tuple = (-spec.estimated_quality, -spec.estimated_tokens_per_second)
+        elif want_fast:
+            pref = (-spec.estimated_tokens_per_second, _queue_seconds(snap))
+        else:
+            pref = (not model.loaded, _queue_seconds(snap))
+        # Deterministic full key: preference, then the historical tiebreakers,
+        # then provider id so ordering never depends on registration order.
+        return (local_first, pref, not model.loaded, _queue_seconds(snap), spec.id)
+
+    eligible.sort(key=_rank)
     snap, model = eligible[0]
     return Placement(
         provider=snap,
@@ -203,13 +255,35 @@ def select_placement(
             "rejected": [r.to_dict() for r in rejections],
             "active_runs": snap.active_runs,
             "estimated_queue_seconds": _queue_seconds(snap),
+            "estimated_tokens_per_second": snap.spec.estimated_tokens_per_second,
+            "estimated_quality": snap.spec.estimated_quality,
+            "latency_preference": workload.latency_preference,
+            "quality_preference": workload.quality_preference,
+            "considered": [
+                {
+                    "provider_id": s.spec.id,
+                    "placement_class": s.spec.placement_class,
+                    "estimated_tokens_per_second": s.spec.estimated_tokens_per_second,
+                    "estimated_quality": s.spec.estimated_quality,
+                    "estimated_queue_seconds": _queue_seconds(s),
+                }
+                for s, _ in eligible
+            ],
         },
     )
 
 
-def estimate(candidates: CandidateSet, workload: WorkloadSpec) -> dict:
+def estimate(
+    candidates: CandidateSet,
+    workload: WorkloadSpec,
+    *,
+    now: float | None = None,
+    max_snapshot_age: float | None = None,
+) -> dict:
     """The /route/estimate wire response. Pure over the snapshot — no I/O."""
-    outcome = select_placement(candidates, workload)
+    outcome = select_placement(
+        candidates, workload, now=now, max_snapshot_age=max_snapshot_age
+    )
     if isinstance(outcome, PlacementRefusal):
         return {
             "eligible": False,
