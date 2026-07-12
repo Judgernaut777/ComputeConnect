@@ -179,14 +179,26 @@ class TestPrivacyPrecedence:
         import sys
         from pathlib import Path
 
-        src = Path("/home/mini/mcp-agentconnect/packages/agentconnect-core/src")
-        if not src.is_dir():
-            import pytest
+        import os
 
+        import pytest
+
+        src = Path(
+            os.environ.get(
+                "AGENTCONNECT_CORE_SRC",
+                "/home/mini/mcp-agentconnect/packages/agentconnect-core/src",
+            )
+        )
+        if not src.is_dir():
             pytest.skip("mcp-agentconnect checkout not available")
         if str(src) not in sys.path:
             sys.path.insert(0, str(src))
-        from agentconnect.core.models import PRIVACY_STRICTNESS as AC
+        try:
+            from agentconnect.core.models import PRIVACY_STRICTNESS as AC
+        except ImportError as exc:
+            # The sibling package (or its deps, e.g. pydantic) is not installed in
+            # this venv — a cross-repo mirror check, not a ComputeConnect failure.
+            pytest.skip(f"agentconnect.core.models not importable here: {exc}")
 
         assert PRIVACY_STRICTNESS == {t.value: rank for t, rank in AC.items()}
 
