@@ -32,6 +32,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not register the simulated cloud provider",
     )
     serve.add_argument("--snapshot-ttl", type=float, default=5.0)
+    serve.add_argument(
+        "--run-journal",
+        default=None,
+        help="path to a SQLite run journal for restart recovery (default: "
+        "in-memory only). In-flight runs are reconciled to 'interrupted' on the "
+        "next start, never left dangling.",
+    )
+    serve.add_argument(
+        "--config",
+        default=None,
+        help="path to a YAML config declaring extra providers/engines "
+        "(env: COMPUTECONNECT_CONFIG). Additive to the default llama.cpp "
+        "upstream + simulated cloud unless the file sets 'defaults: {...}'.",
+    )
     serve.add_argument("--log-level", default="info")
     return parser
 
@@ -41,13 +55,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         import uvicorn
 
-        from .app import build_default_config, create_app
+        from .app import create_app
+        from .config import load_app_config
 
         app = create_app(
-            build_default_config(
-                args.upstream,
+            load_app_config(
+                args.config,
+                upstream_url=args.upstream,
                 include_sim_cloud=not args.no_sim_cloud,
                 snapshot_ttl=args.snapshot_ttl,
+                run_journal_path=args.run_journal,
             )
         )
         uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
