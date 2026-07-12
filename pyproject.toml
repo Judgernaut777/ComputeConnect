@@ -19,6 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# YAML config files (--config foo.yaml). JSON config needs nothing extra.
+config = ["pyyaml>=6"]
 
 [project.scripts]
 computeconnect = "computeconnect.cli:main"

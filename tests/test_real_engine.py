@@ -22,13 +22,22 @@ from computeconnect.providers import ProviderSpec
 from conftest import ServerHandle
 
 REAL_UPSTREAM = "http://127.0.0.1:8080"
+#: A SECOND real engine of a materially different shape: a 4B dense model with
+#: an 8k context window, vs the 30B MoE / 16k window on :8080. Stand it up with
+#:   scripts/second_engine.sh   (or the Wave-A demo runner). Tests that need it
+#: skip when it is absent — they never fake heterogeneity.
+REAL_UPSTREAM_B = "http://127.0.0.1:8091"
+
+
+def _up(url: str) -> bool:
+    try:
+        return httpx.get(f"{url}/health", timeout=3).json().get("status") == "ok"
+    except Exception:
+        return False
 
 
 def _engine_up() -> bool:
-    try:
-        return httpx.get(f"{REAL_UPSTREAM}/health", timeout=3).json().get("status") == "ok"
-    except Exception:
-        return False
+    return _up(REAL_UPSTREAM)
 
 
 pytestmark = pytest.mark.skipif(
@@ -181,3 +190,132 @@ def test_real_openai_layer_small(real_stack):
     )
     assert resp.status_code == 200
     assert resp.json()["choices"][0]["message"]["content"].strip()
+
+
+# --------------------------------------------------------------------------
+# REAL heterogeneous placement across TWO real engines of different shape.
+# Skips (never fakes) when the second engine on :8091 is not running.
+# --------------------------------------------------------------------------
+
+_two_engines = pytest.mark.skipif(
+    not (_up(REAL_UPSTREAM) and _up(REAL_UPSTREAM_B)),
+    reason=f"needs BOTH real engines ({REAL_UPSTREAM} 30B/16k and "
+    f"{REAL_UPSTREAM_B} 4B/8k); start the second with scripts/second_engine.sh",
+)
+
+
+@pytest.fixture(scope="module")
+def hetero_stack():
+    """ComputeConnect fronting two REAL, materially-different local engines:
+    the 30B MoE (higher quality, slower, 16k ctx) and the 4B dense (faster,
+    lower quality, 8k ctx). Declared quality/tps reflect that reality."""
+    config = AppConfig(
+        providers=[
+            ProviderSpec(
+                id="local-30b",
+                placement_class="local",
+                engine=LlamaCppEngine(REAL_UPSTREAM, stream_timeout=300.0),
+                capabilities=("completion", "chat", "generate", "code", "summarize"),
+                max_concurrency=1,
+                estimated_tokens_per_second=12.0,
+                estimated_quality=0.9,
+            ),
+            ProviderSpec(
+                id="local-4b",
+                placement_class="local",
+                engine=LlamaCppEngine(REAL_UPSTREAM_B, stream_timeout=300.0),
+                capabilities=("completion", "chat", "generate"),
+                max_concurrency=2,
+                estimated_tokens_per_second=90.0,
+                estimated_quality=0.55,
+            ),
+        ],
+        snapshot_ttl=2.0,
+    )
+    handle = ServerHandle(create_app(config)).start()
+    try:
+        yield handle.base_url
+    finally:
+        handle.stop()
+
+
+@_two_engines
+def test_two_real_engines_both_visible(hetero_stack):
+    ids = {m["id"] for m in httpx.get(f"{hetero_stack}/models", timeout=15).json()["models"]}
+    assert {"qwen3-30b-a3b", "qwen3-4b"} <= ids
+
+
+@_two_engines
+def test_latency_preference_selects_the_fast_real_engine(hetero_stack):
+    body = httpx.post(
+        f"{hetero_stack}/route/estimate",
+        json={
+            "task_type": "general",
+            "privacy_tier": "local_only",
+            "required_capabilities": ["generate"],
+            "context_tokens": 128,
+            "max_output_tokens": 64,
+            "latency_preference": "low_latency",
+        },
+        timeout=15,
+    ).json()
+    assert body["eligible"] is True
+    assert body["selected_model"] == "qwen3-4b"  # the fast 4B node
+    assert body["reason"]["provider_id"] == "local-4b"
+
+
+@_two_engines
+def test_quality_preference_selects_the_accurate_real_engine(hetero_stack):
+    body = httpx.post(
+        f"{hetero_stack}/route/estimate",
+        json={
+            "task_type": "general",
+            "privacy_tier": "local_only",
+            "required_capabilities": ["generate"],
+            "context_tokens": 128,
+            "max_output_tokens": 64,
+            "quality_preference": "high",
+        },
+        timeout=15,
+    ).json()
+    assert body["eligible"] is True
+    assert body["selected_model"] == "qwen3-30b-a3b"  # the accurate 30B node
+    assert body["reason"]["provider_id"] == "local-30b"
+
+
+@_two_engines
+def test_large_context_only_fits_the_big_window_engine(hetero_stack):
+    """A context beyond the 4B node's 8k window must place on the 30B/16k node
+    even under a latency preference — real capacity/capability placement."""
+    body = httpx.post(
+        f"{hetero_stack}/route/estimate",
+        json={
+            "task_type": "general",
+            "privacy_tier": "local_only",
+            "required_capabilities": ["generate"],
+            "context_tokens": 12000,  # > 8192, <= 16384
+            "max_output_tokens": 512,
+            "latency_preference": "low_latency",
+        },
+        timeout=15,
+    ).json()
+    assert body["eligible"] is True
+    assert body["selected_model"] == "qwen3-30b-a3b"
+
+
+@_two_engines
+def test_real_generation_from_BOTH_engines(hetero_stack):
+    """Real CPU inference from each of the two real engines, selected by
+    pinning the model — proof that both actually run, not one plus a sim."""
+    for model in ("qwen3-4b", "qwen3-30b-a3b"):
+        resp = httpx.post(
+            f"{hetero_stack}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "Reply with just: OK"}],
+                "max_tokens": 24,
+            },
+            timeout=240,
+        )
+        assert resp.status_code == 200, model
+        assert resp.json()["choices"][0]["message"]["content"].strip(), model
