@@ -7,6 +7,7 @@ upstream (never touched) and 8787 is reserved for BrainConnect.
 from __future__ import annotations
 
 import argparse
+import os
 
 from . import __version__
 
@@ -47,6 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
         "upstream + simulated cloud unless the file sets 'defaults: {...}'.",
     )
     serve.add_argument("--log-level", default="info")
+    serve.add_argument(
+        "--token",
+        default=None,
+        help="bearer token required (as 'Authorization: Bearer <token>') on every "
+        "route but /health (env: COMPUTECONNECT_TOKEN). Never pass a real secret "
+        "as a bare flag on a shared host (argv is visible in `ps`) — prefer the "
+        "env var. Required to bind a non-loopback --host.",
+    )
     return parser
 
 
@@ -55,8 +64,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         import uvicorn
 
-        from .app import create_app
-        from .config import load_app_config
+        from .app import LOOPBACK_HOSTS, create_app
+        from .config import TOKEN_ENV, load_app_config
+
+        token = args.token if args.token is not None else os.environ.get(TOKEN_ENV)
+        if args.host not in LOOPBACK_HOSTS and not token:
+            # A non-loopback bind with no token would put an unauthenticated
+            # inference + cancellation surface on a reachable interface.
+            # Refuse here — the same check create_app(host=...) makes below is
+            # defense in depth, not a substitute for failing fast at the CLI.
+            raise SystemExit(
+                f"refusing to bind {args.host} without authentication: set "
+                f"--token (or ${TOKEN_ENV}), or bind a loopback host "
+                f"({', '.join(sorted(LOOPBACK_HOSTS))})."
+            )
 
         app = create_app(
             load_app_config(
@@ -65,7 +86,9 @@ def main(argv: list[str] | None = None) -> int:
                 include_sim_cloud=not args.no_sim_cloud,
                 snapshot_ttl=args.snapshot_ttl,
                 run_journal_path=args.run_journal,
-            )
+                token=token,
+            ),
+            host=args.host,
         )
         uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
