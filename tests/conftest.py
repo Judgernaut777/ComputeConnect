@@ -48,6 +48,25 @@ class FakeLlamaUpstream:
         self.models_requests = 0
         self.completed = 0
         self.disconnects = 0
+        #: /health response controls. HTTP status is independent of body
+        #: shape: a llama-swap-style proxy answers a healthy 200 with a plain
+        #: "OK" body rather than JSON; a real outage is a non-200 regardless
+        #: of body.
+        self.health_status = 200
+        #: When set, /health responds with this exact text and a
+        #: ``text/plain`` content type instead of the default JSON body —
+        #: simulating a proxy (e.g. llama-swap) that doesn't speak JSON here.
+        self.health_plain_text: str | None = None
+        #: When set, the final SSE chunk before ``[DONE]`` carries this dict
+        #: as ``"usage"`` (with empty ``choices``), the way a real
+        #: OpenAI-compatible server answers when the request set
+        #: ``stream_options.include_usage``. ``None`` means the upstream never
+        #: reports usage (ComputeConnect must fall back to its estimate).
+        self.usage_response: dict | None = None
+        #: The last chat-completions request body this upstream received —
+        #: lets tests assert ComputeConnect actually asked for usage via
+        #: ``stream_options``.
+        self.last_chat_request: dict | None = None
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] == "lifespan":
@@ -63,7 +82,10 @@ class FakeLlamaUpstream:
         method, path = scope["method"], scope["path"]
         if method == "GET" and path == "/health":
             self.health_requests += 1
-            await self._json(send, {"status": "ok"})
+            if self.health_plain_text is not None:
+                await self._text(send, self.health_plain_text, status=self.health_status)
+            else:
+                await self._json(send, {"status": "ok"}, status=self.health_status)
         elif method == "GET" and path == "/v1/models":
             self.models_requests += 1
             await self._json(
@@ -97,6 +119,17 @@ class FakeLlamaUpstream:
         )
         await send({"type": "http.response.body", "body": body})
 
+    @staticmethod
+    async def _text(send, text: str, status: int = 200) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", b"text/plain")],
+            }
+        )
+        await send({"type": "http.response.body", "body": text.encode()})
+
     async def _chat(self, receive, send) -> None:
         raw = b""
         while True:
@@ -107,6 +140,7 @@ class FakeLlamaUpstream:
             if not msg.get("more_body"):
                 break
         request = json.loads(raw or b"{}")
+        self.last_chat_request = request
         self.chat_requests += 1
         limit = int(request.get("max_tokens") or 10**9)
         n = min(limit, self.response_tokens)
@@ -146,6 +180,15 @@ class FakeLlamaUpstream:
                 # This send has returned: the byte left our buffer only because
                 # the downstream made room. Under backpressure it blocks here.
                 self.sent_tokens += 1
+            if self.usage_response is not None:
+                usage_chunk = {"choices": [], "usage": self.usage_response}
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": f"data: {json.dumps(usage_chunk)}\n\n".encode(),
+                        "more_body": True,
+                    }
+                )
             await send(
                 {"type": "http.response.body", "body": b"data: [DONE]\n\n", "more_body": False}
             )

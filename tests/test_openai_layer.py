@@ -33,6 +33,55 @@ def test_chat_completion_non_streaming(stack):
     assert resp.headers["X-Run-Id"]
 
 
+def test_chat_completion_usage_prefers_real_upstream_numbers(stack):
+    """When the upstream reports a real usage block (as an OpenAI-compatible
+    server does when stream_options.include_usage is set), the response must
+    echo those exact numbers, with total == prompt + completion — not the
+    chars/4 estimate."""
+    stack.upstream.usage_response = {
+        "prompt_tokens": 123,
+        "completion_tokens": 45,
+        "total_tokens": 168,
+    }
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        json={
+            "model": "fake-llama-7b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+        },
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    usage = resp.json()["usage"]
+    assert usage["prompt_tokens"] == 123
+    assert usage["completion_tokens"] == 45
+    assert usage["total_tokens"] == 168
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    # The engine must have asked for it: this is what upstream real-usage
+    # servers gate the final usage chunk on.
+    assert stack.upstream.last_chat_request["stream_options"] == {"include_usage": True}
+
+
+def test_chat_completion_usage_falls_back_to_estimate_with_correct_total(stack):
+    """When the upstream never reports usage, total_tokens must still equal
+    prompt_tokens + completion_tokens — never the old hardcoded 0."""
+    assert stack.upstream.usage_response is None  # default: no upstream usage
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        json={
+            "model": "fake-llama-7b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+        },
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    usage = resp.json()["usage"]
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    assert usage["total_tokens"] > 0
+
+
 def test_chat_completion_streaming_sse(stack):
     deltas = []
     finish = None
