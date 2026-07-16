@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install computeconnect (editable) + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev,config]
+
+      - name: Run offline test suite
+        # tests/test_real_engine.py needs a live llama.cpp server on :8080 (and a
+        # second one on :8091 for the heterogeneous-placement tests); it already
+        # self-skips via a module-level pytest.mark.skipif when no engine is
+        # reachable, but there is no such server in this runner at all, so the
+        # file is excluded explicitly rather than relying on that runtime check.
+        run: python -m pytest -o addopts="" -q --ignore=tests/test_real_engine.py

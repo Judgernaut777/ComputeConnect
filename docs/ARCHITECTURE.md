@@ -1,5 +1,12 @@
 # Architecture
 
+> **SUPERSEDED (2026-07-17):** This is the pre-implementation design draft. A real **v0.1.0**
+> runtime now exists — see [docs/STATUS.md](STATUS.md) and [README.md](../README.md) for what is
+> actually implemented and its current test results. The "no code exists" / "no implementation"
+> statements below are historical: they describe the state of the project when this document was
+> written, not the state of the project today. The body of this document is left as the historical
+> design record and is not being updated to match the shipped code.
+
 **Status:** draft. No code exists. **D1 and D2 are ratified** (2026-07-10) and are stated as
 settled below. D3–D6 remain open and are called out inline.
 
@@ -424,6 +431,8 @@ defense in depth — but the invariant above must already make the system safe w
 ## 7. Integration contracts
 
 > No implementation. These define the boundary and the direction of the call.
+> _(Historical — see the SUPERSEDED banner at the top of this document; v0.1.0 conforms to these
+> contracts. See [docs/STATUS.md](STATUS.md).)_
 
 ### 7.1 AgentConnect conformance
 
@@ -534,7 +543,8 @@ Three constraints:
    ComputeConnect **fails closed** per the structural invariant in §6: cloud providers are filtered
    out of the candidate set before placement, and an empty set yields a structured refusal.
    Admission never downgrades privacy to satisfy a placement. There is no implementation in this
-   phase; the invariant is the architecture.
+   phase; the invariant is the architecture. _(Historical — this invariant is now implemented as
+   structural privacy filtering; see [docs/STATUS.md](STATUS.md).)_
 
 **Which surface (D4, ratified):** BrainConnect consumes the **Layer 2 inference API**
 (OpenAI-compatible), which its librarian already speaks. AgentConnect consumes the **Layer 1 control
