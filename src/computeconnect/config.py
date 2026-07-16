@@ -19,6 +19,8 @@ Schema (all keys optional; unknown keys ignored)::
     max_snapshot_age: 30.0       # seconds; fail-closed staleness ceiling
     run_journal: /path/runs.db   # enable durable runs + restart reconciliation
     include_sim_cloud: false     # append the simulated cloud provider too
+    token: <bearer-token>        # require Authorization: Bearer <token> on all
+                                 # routes but /health (env: COMPUTECONNECT_TOKEN)
     providers:
       local-llamacpp:
         engine: llamacpp         # llamacpp | simulated_cloud
@@ -49,6 +51,15 @@ from .providers import ProviderSpec
 
 #: Environment variable naming a ComputeConnect config file.
 CONFIG_ENV = "COMPUTECONNECT_CONFIG"
+
+#: Environment variable holding the bearer token that authenticates every
+#: route but ``/health`` (see ``app._BearerAuthMiddleware``). Resolved in
+#: :func:`load_app_config` the same way ``CONFIG_ENV`` is: an explicit
+#: ``token=`` argument (e.g. a CLI ``--token`` flag) wins, then the env var,
+#: then unset (open, matching the historical loopback-only behavior). A config
+#: file's own ``token`` key, if present, wins over both — same precedence as
+#: ``run_journal``.
+TOKEN_ENV = "COMPUTECONNECT_TOKEN"
 
 _DEFAULT_CAPS = ("completion", "chat", "generate")
 
@@ -84,6 +95,7 @@ def app_config_from_dict(
     include_sim_cloud: bool = True,
     snapshot_ttl: float = 5.0,
     run_journal_path: str | None = None,
+    token: str | None = None,
 ) -> AppConfig:
     """Build an :class:`AppConfig` from a parsed config mapping.
 
@@ -116,6 +128,7 @@ def app_config_from_dict(
         )
         if "max_snapshot_age" in raw:
             base.max_snapshot_age = raw.get("max_snapshot_age")
+        base.token = raw.get("token") or token
         return base
 
     return AppConfig(
@@ -123,6 +136,7 @@ def app_config_from_dict(
         snapshot_ttl=float(raw.get("snapshot_ttl", snapshot_ttl)),
         max_snapshot_age=raw.get("max_snapshot_age"),
         run_journal_path=raw.get("run_journal") or run_journal_path,
+        token=raw.get("token") or token,
     )
 
 
@@ -149,21 +163,32 @@ def load_app_config(
     include_sim_cloud: bool = True,
     snapshot_ttl: float = 5.0,
     run_journal_path: str | None = None,
+    token: str | None = None,
 ) -> AppConfig:
     """Load config from ``path`` (or ``$COMPUTECONNECT_CONFIG``), or fall back
-    to the built-in default fleet when neither is set."""
+    to the built-in default fleet when neither is set.
+
+    ``token``: an explicit bearer token (e.g. a CLI ``--token`` flag) wins;
+    otherwise ``$COMPUTECONNECT_TOKEN`` is used; otherwise the app stays open,
+    matching the historical loopback-only behavior. A config file's own
+    ``token`` key wins over both — see :func:`app_config_from_dict`.
+    """
+    token = token if token is not None else os.environ.get(TOKEN_ENV)
     path = path or os.environ.get(CONFIG_ENV)
     if not path:
-        return build_default_config(
+        config = build_default_config(
             upstream_url,
             include_sim_cloud=include_sim_cloud,
             snapshot_ttl=snapshot_ttl,
             run_journal_path=run_journal_path,
         )
+        config.token = token
+        return config
     return app_config_from_dict(
         _read_file(path),
         upstream_url=upstream_url,
         include_sim_cloud=include_sim_cloud,
         snapshot_ttl=snapshot_ttl,
         run_journal_path=run_journal_path,
+        token=token,
     )

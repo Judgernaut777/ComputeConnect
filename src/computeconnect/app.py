@@ -25,11 +25,13 @@ upstream connection mid-generation.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import time
 from dataclasses import dataclass, field
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
@@ -52,6 +54,59 @@ from .runs import Run, RunJournal, RunRegistry
 _CANCELLED = object()
 _DONE = object()
 
+#: Hosts that keep the surface off the network. A bind to anything else exposes
+#: an unauthenticated inference + cancellation surface, so it must carry a
+#: bearer token. Shared by the CLI's pre-flight check and enforced again in
+#: :func:`create_app` (defense in depth: no entry path — CLI, embedder, or
+#: test — can open an authenticated-optional surface on a reachable interface).
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+#: Routes that stay reachable with no token, even when one is configured, so
+#: orchestration healthchecks (compose/k8s liveness probes) keep working
+#: without needing a credential. Every other route is covered.
+_AUTH_EXEMPT_PATHS = frozenset({"/health"})
+
+
+class _BearerAuthMiddleware:
+    """Requires ``Authorization: Bearer <token>`` on every route but ``/health``
+    when a token is configured; a no-op when it is not (back-compat with the
+    historical open loopback deployment).
+
+    A pure ASGI middleware rather than ``BaseHTTPMiddleware``: it never touches
+    ``send``/``receive`` for an accepted request, so the streaming bodies of
+    ``/generate`` and the OpenAI SSE path reach the client untouched and the
+    precise cancel-on-disconnect behavior the streaming tests exercise is
+    unaffected. Comparison is constant-time (``hmac.compare_digest``).
+    """
+
+    def __init__(self, app, *, token: str | None) -> None:
+        self.app = app
+        self.token = token or None
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or not self.token:
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path") in _AUTH_EXEMPT_PATHS:
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers") or ())
+        raw = headers.get(b"authorization", b"").decode("latin-1")
+        scheme, _, presented = raw.partition(" ")
+        if (
+            scheme.lower() != "bearer"
+            or not presented
+            or not hmac.compare_digest(presented.strip(), self.token)
+        ):
+            response = JSONResponse(
+                {"error": "missing or invalid bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
 
 @dataclass
 class AppConfig:
@@ -69,6 +124,12 @@ class AppConfig:
     #: the terminal ``interrupted`` state (never lost, never dangling). ``None``
     #: keeps the historical pure in-memory registry.
     run_journal_path: str | None = None
+    #: Optional bearer credential. When set, every route but ``/health``
+    #: requires ``Authorization: Bearer <token>`` (see ``_BearerAuthMiddleware``).
+    #: ``None`` (the default) preserves the historical open-loopback behavior.
+    #: Read from ``$COMPUTECONNECT_TOKEN`` by :func:`config.load_app_config`;
+    #: settable here directly by programmatic callers/tests.
+    token: str | None = None
 
     def effective_max_snapshot_age(self) -> float | None:
         if self.max_snapshot_age is not None:
@@ -624,8 +685,26 @@ class ComputeConnectAPI:
         )
 
 
-def create_app(config: AppConfig | None = None) -> Starlette:
-    api = ComputeConnectAPI(config or build_default_config())
+def create_app(config: AppConfig | None = None, *, host: str | None = None) -> Starlette:
+    """Build the Starlette app.
+
+    ``host``: the interface this app is *about to be bound to*, if known. When
+    given and non-loopback with no ``config.token`` set, this raises — not only
+    the CLI checks (defense in depth: a programmatic embedder cannot construct
+    an open, unauthenticated app for a reachable interface either). ``None``
+    (the default, and what every existing in-process/test caller passes)
+    skips the check, since those callers do not always know or control the
+    eventual bind address.
+    """
+    config = config or build_default_config()
+    if host is not None and host not in LOOPBACK_HOSTS and not config.token:
+        raise ValueError(
+            f"refusing to build an app for {host!r} without authentication: a "
+            f"non-loopback bind exposes an unauthenticated inference and "
+            f"cancellation surface. Set COMPUTECONNECT_TOKEN (or config.token), "
+            f"or bind a loopback host ({', '.join(sorted(LOOPBACK_HOSTS))})."
+        )
+    api = ComputeConnectAPI(config)
     app = Starlette(
         routes=[
             Route("/health", api.health, methods=["GET"]),
@@ -637,7 +716,8 @@ def create_app(config: AppConfig | None = None) -> Starlette:
             Route("/runs/{run_id}", api.run_metadata, methods=["GET"]),
             Route("/v1/models", api.v1_models, methods=["GET"]),
             Route("/v1/chat/completions", api.v1_chat_completions, methods=["POST"]),
-        ]
+        ],
+        middleware=[Middleware(_BearerAuthMiddleware, token=config.token)],
     )
     app.state.api = api
     return app
