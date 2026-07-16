@@ -73,7 +73,19 @@ class LlamaCppEngine:
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.get(f"{self.base_url}/health")
             resp.raise_for_status()
-            return resp.json()
+            # A non-200 is still unhealthy (raise_for_status above already
+            # covers that). But a *200* is a live signal even when the body
+            # isn't JSON: llama-swap and some proxies answer /health with a
+            # plain-text "OK" rather than a JSON document. Treat any non-JSON
+            # 200 body as a healthy status-shaped dict, mirroring the
+            # {"status": "ok"} shape ProviderRegistry._refresh() expects (it
+            # only treats "unreachable"/"down"/"error" as unhealthy — anything
+            # else, including this fallback, reads as up).
+            try:
+                return resp.json()
+            except ValueError:
+                text = resp.text.strip()
+                return {"status": "ok", "raw": text[:200]}
 
     async def list_models(self) -> list[ModelInfo]:
         async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -103,12 +115,22 @@ class LlamaCppEngine:
         *,
         max_tokens: int,
         temperature: float,
+        usage_sink: dict | None = None,
     ) -> AsyncIterator[str]:
         """Proxy a streaming chat completion, yielding text deltas.
 
         The httpx stream context is closed when this generator is closed,
         which drops the upstream connection — that is how cancellation
         propagates to the engine.
+
+        ``usage_sink``, when given, is a caller-owned dict mutated in place
+        with the upstream's real ``usage`` block (prompt/completion/total
+        tokens) if and when it arrives. OpenAI-compatible servers only emit
+        that block for a streamed request when asked via
+        ``stream_options.include_usage``, so this always sets that flag; a
+        fresh dict per call keeps concurrent runs from clobbering each
+        other's counts. Callers that don't care pass nothing and the field is
+        never read.
         """
         payload = {
             "model": model,
@@ -116,6 +138,7 @@ class LlamaCppEngine:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         timeout = httpx.Timeout(self._timeout, read=self._stream_timeout)
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -139,6 +162,13 @@ class LlamaCppEngine:
                         delta = (choice.get("delta") or {}).get("content")
                         if delta:
                             yield delta
+                    # The real-usage chunk (OpenAI convention) typically has
+                    # empty/absent choices and carries only "usage" — check
+                    # unconditionally, not just when choices was empty.
+                    usage = chunk.get("usage")
+                    if usage is not None and usage_sink is not None:
+                        usage_sink.clear()
+                        usage_sink.update(usage)
 
 
 class SimulatedCloudEngine:
@@ -193,7 +223,12 @@ class SimulatedCloudEngine:
         *,
         max_tokens: int,
         temperature: float,
+        usage_sink: dict | None = None,
     ) -> AsyncIterator[str]:
+        # Simulated: no real upstream usage block to report. usage_sink is
+        # accepted (not populated) purely so callers can treat every engine
+        # identically and exercise the estimate-fallback path against this
+        # engine deliberately.
         if self.fail_health:
             raise EngineError("simulated cloud outage")
         self.chat_requests += 1

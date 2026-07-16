@@ -577,9 +577,17 @@ class ComputeConnectAPI:
         max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
         temperature = float(body.get("temperature") or 0.0)
         engine = outcome.provider.spec.engine
+        # Mutated in place by the engine if/when the upstream reports real
+        # usage (see LlamaCppEngine.stream_chat); a fresh dict per request so
+        # concurrent runs never share state.
+        real_usage: dict = {}
         upstream = UpstreamStream(
             engine.stream_chat(
-                outcome.model.id, messages, max_tokens=max_tokens, temperature=temperature
+                outcome.model.id,
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                usage_sink=real_usage,
             )
         )
 
@@ -611,6 +619,18 @@ class ComputeConnectAPI:
             await upstream.aclose()
         self.runs.finish(run, status, chunks=len(parts))
         text = "".join(parts)
+        # Prefer the upstream's real usage (captured via usage_sink) over the
+        # chars/4 estimate; either way total_tokens is derived, never a
+        # hardcoded 0. Only trust the real block when it has both token
+        # counts — a partial/malformed block falls back to the estimate.
+        if "prompt_tokens" in real_usage and "completion_tokens" in real_usage:
+            prompt_tokens = int(real_usage["prompt_tokens"])
+            completion_tokens = int(real_usage["completion_tokens"])
+            total_tokens = int(real_usage.get("total_tokens", prompt_tokens + completion_tokens))
+        else:
+            prompt_tokens = sum(len(str(m.get("content", ""))) // 4 for m in messages)
+            completion_tokens = max(1, len(text) // 4)
+            total_tokens = prompt_tokens + completion_tokens
         return JSONResponse(
             {
                 "id": f"chatcmpl-{run.id}",
@@ -625,11 +645,9 @@ class ComputeConnectAPI:
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": sum(
-                        len(str(m.get("content", ""))) // 4 for m in messages
-                    ),
-                    "completion_tokens": max(1, len(text) // 4),
-                    "total_tokens": 0,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
                 },
             },
             headers={"X-Run-Id": run.id},

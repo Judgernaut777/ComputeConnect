@@ -60,6 +60,29 @@ def test_upstream_down_health_is_degraded_not_error(stack_upstream_down):
     assert "unreachable" in body["providers"]["local-llamacpp"]["detail"]
 
 
+def test_health_plain_text_200_body_is_treated_as_healthy(stack):
+    """A proxy like llama-swap answers /health with a plain-text "OK" body,
+    not JSON. resp.json() on that must not make ComputeConnect mark the
+    provider unreachable/degraded — a 200 is a 200."""
+    stack.upstream.health_plain_text = "OK"
+    resp = httpx.get(f"{stack.base_url}/health", timeout=15)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["providers"]["local-llamacpp"]["healthy"] is True
+
+
+def test_health_non_200_is_still_unhealthy(stack):
+    """A non-200 /health must still count as unhealthy, plain-text body or
+    not — only the *body-shape* tolerance changed, not the status check."""
+    stack.upstream.health_status = 500
+    resp = httpx.get(f"{stack.base_url}/health", timeout=15)
+    assert resp.status_code == 200  # ComputeConnect's own /health always 200s
+    body = resp.json()
+    assert body["providers"]["local-llamacpp"]["healthy"] is False
+    assert body["status"] == "degraded"  # sim-cloud still up
+
+
 def test_upstream_down_models_omits_dead_provider(stack_upstream_down):
     body = httpx.get(f"{stack_upstream_down.base_url}/models", timeout=15).json()
     assert {m["id"] for m in body["models"]} == {"sim-cloud-large"}
