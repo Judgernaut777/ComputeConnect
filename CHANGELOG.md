@@ -28,6 +28,12 @@
 * 66 → **109** passing: privacy precedence property tests (incl. conflicting header-vs-body),
   preference + staleness placement, backpressure under a slow consumer, provider failover, run-journal
   restart reconciliation over real HTTP, config surface, and two-real-engine placement/generation.
+* **Update (2026-07-17):** the suite has grown to **140 tests** (129 offline, always green, plus 11
+  against a live `:8080` real engine) after the bearer-auth hardening landed
+  (`tests/test_auth.py`, 25 tests, not yet its own entry above). 9 of the 11 real-engine tests
+  currently **fail, not skip** — this is **environmental, not a product regression**: they assert
+  the hardcoded model id `qwen3-30b-a3b`, but the host's `:8080` engine was renamed to
+  `qwen3.6-35b-a3b` on 2026-07-13. See [docs/STATUS.md](docs/STATUS.md) for the current gate result.
 
 ### Docs
 

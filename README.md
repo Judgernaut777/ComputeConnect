@@ -26,7 +26,8 @@ python3 -m venv .venv && .venv/bin/pip install -e .   # or: uv pip install -e .
   providers are filtered before placement and refusals are structured, never silent downgrades.
 
 Tests: `.venv/bin/python -m pytest` (installs `pytest` via `pip install -e .[dev]`; real-engine
-tests skip when no llama.cpp is reachable on `:8080`).
+tests skip when no llama.cpp is reachable on `:8080`). 140 tests total, 129 of them fully offline;
+see [docs/STATUS.md](docs/STATUS.md) for the current pass count and the real-engine caveat.
 
 ---
 
@@ -94,7 +95,7 @@ simulated, and the heterogeneity premise is therefore still **unproven** — sta
 | AgentConnect contract | **Conformed to and tested with AgentConnect's shipped client**, including against the real local engine |
 | BrainConnect contract | Drafted — a compute consumer on the inference API, not a peer scheduler; nothing rewired yet |
 | ToolConnect contract | **Provisional** — validated runtime but no compute-facing surface yet |
-| Code | `computeconnect` 0.1.0: both API layers, structural privacy, streaming + cancellation, 64 tests |
+| Code | `computeconnect` 0.1.0: both API layers, structural privacy, streaming + cancellation, 140 tests (129 offline + 11 real-engine) |
 | Decisions | **D1–D6 all ratified** — implementation status per decision in [STATUS.md](docs/STATUS.md) |
 | License | **Apache-2.0** |
 
