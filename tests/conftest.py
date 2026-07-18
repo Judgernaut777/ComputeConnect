@@ -67,6 +67,19 @@ class FakeLlamaUpstream:
         #: lets tests assert ComputeConnect actually asked for usage via
         #: ``stream_options``.
         self.last_chat_request: dict | None = None
+        #: When set, each streamed token chunk carries this string as
+        #: ``delta.reasoning_content`` in addition to (or instead of) normal
+        #: ``delta.content`` — simulating a reasoning model (glm-4.7,
+        #: qwen3.6, gemma-4, gpt-oss) that emits its chain-of-thought on a
+        #: separate channel. ``None`` (default): no reasoning channel, the
+        #: upstream behaves exactly as before.
+        self.reasoning_response: str | None = None
+        #: When True, the upstream emits ONLY reasoning_content deltas (no
+        #: `content` at all) and finishes with ``finish_reason: "length"`` —
+        #: simulating a reasoning model whose token budget ran out mid-thought
+        #: before it ever wrote a final answer. Requires
+        #: ``reasoning_response`` to be set.
+        self.truncate_mid_reasoning = False
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] == "lifespan":
@@ -163,23 +176,70 @@ class FakeLlamaUpstream:
                     "headers": [(b"content-type", b"text/event-stream")],
                 }
             )
-            for i in range(n):
-                await asyncio.sleep(self.token_delay)
-                if disconnected.is_set():
-                    self.disconnects += 1
-                    return
-                content = f"tok{i} " + ("x" * self.token_bytes)
-                chunk = {"choices": [{"index": 0, "delta": {"content": content}}]}
+            if self.reasoning_response is not None:
+                # A reasoning model's chain-of-thought arrives on its own
+                # delta channel, separate from `content`.
+                reasoning_chunk = {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"reasoning_content": self.reasoning_response},
+                        }
+                    ]
+                }
                 await send(
                     {
                         "type": "http.response.body",
-                        "body": f"data: {json.dumps(chunk)}\n\n".encode(),
+                        "body": f"data: {json.dumps(reasoning_chunk)}\n\n".encode(),
                         "more_body": True,
                     }
                 )
-                # This send has returned: the byte left our buffer only because
-                # the downstream made room. Under backpressure it blocks here.
-                self.sent_tokens += 1
+            if self.reasoning_response is not None and self.truncate_mid_reasoning:
+                # The token budget ran out while the model was still
+                # thinking: no `content` is ever produced, and the upstream's
+                # own finish_reason says so (the real-world signal this whole
+                # feature is built to detect).
+                finish_chunk = {
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+                }
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": f"data: {json.dumps(finish_chunk)}\n\n".encode(),
+                        "more_body": True,
+                    }
+                )
+            else:
+                for i in range(n):
+                    await asyncio.sleep(self.token_delay)
+                    if disconnected.is_set():
+                        self.disconnects += 1
+                        return
+                    content = f"tok{i} " + ("x" * self.token_bytes)
+                    chunk = {"choices": [{"index": 0, "delta": {"content": content}}]}
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": f"data: {json.dumps(chunk)}\n\n".encode(),
+                            "more_body": True,
+                        }
+                    )
+                    # This send has returned: the byte left our buffer only because
+                    # the downstream made room. Under backpressure it blocks here.
+                    self.sent_tokens += 1
+                if self.reasoning_response is not None:
+                    # Reasoning finished, real content followed: an ordinary
+                    # terminal finish_reason.
+                    finish_chunk = {
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    }
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": f"data: {json.dumps(finish_chunk)}\n\n".encode(),
+                            "more_body": True,
+                        }
+                    )
             if self.usage_response is not None:
                 usage_chunk = {"choices": [], "usage": self.usage_response}
                 await send(

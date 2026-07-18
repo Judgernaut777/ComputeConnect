@@ -54,6 +54,22 @@ from .runs import Run, RunJournal, RunRegistry
 _CANCELLED = object()
 _DONE = object()
 
+#: NO-SILENT-EMPTY: reasoning models (glm-4.7, qwen3.6, gemma-4, gpt-oss on
+#: this deployment's upstream) stream their chain-of-thought into
+#: ``reasoning_content`` and only write ``content`` once thinking finishes.
+#: When the token budget runs out mid-thought (upstream
+#: ``finish_reason == "length"``), ``content`` is legitimately empty even
+#: though the model generated hundreds of real tokens — returning a bare ""
+#: is indistinguishable from a genuine failure to both an OpenAI client and
+#: the AgentConnect worker that stores the response verbatim as an artifact.
+#: Both the OpenAI-compat layer and the /generate control-plane layer swap in
+#: this marker instead of a silent empty string when that specific condition
+#: holds (empty content + real reasoning + finish_reason == "length"); a
+#: normal completed response with real content is never touched.
+_REASONING_TRUNCATED_MARKER = (
+    "[truncated: model was still reasoning; increase max_tokens]"
+)
+
 #: Hosts that keep the surface off the network. A bind to anything else exposes
 #: an unauthenticated inference + cancellation surface, so it must carry a
 #: bearer token. Shared by the CLI's pre-flight check and enforced again in
@@ -421,12 +437,18 @@ class ComputeConnectAPI:
         chunks = 0
         chars = 0
         started = time.time()
+        # Mutated in place by the engine if/when the upstream reports
+        # reasoning_content and/or a terminal finish_reason (see
+        # LlamaCppEngine.stream_chat); a fresh dict per request so concurrent
+        # runs never share state.
+        reasoning: dict = {}
         upstream = UpstreamStream(
             engine.stream_chat(
                 model.id,
                 self._messages_from_generate(body),
                 max_tokens=max_tokens,
                 temperature=temperature,
+                reasoning_sink=reasoning,
             )
         ).start()
         try:
@@ -460,6 +482,30 @@ class ComputeConnectAPI:
                 duration_seconds=round(time.time() - started, 4),
             )
 
+        reasoning_text = reasoning.get("text", "")
+        # NO-SILENT-EMPTY (see _REASONING_TRUNCATED_MARKER): the AgentConnect
+        # worker (LocalModelManagerWorkerAdapter) stores this "output" field
+        # verbatim as an artifact with no guard against emptiness. If the run
+        # otherwise "succeeded" with zero content but the model was
+        # genuinely mid-thought when max_output_tokens ran out, put the
+        # marker (plus the real reasoning, so nothing already paid for is
+        # lost) into "output" instead of leaving the artifact truly empty.
+        if (
+            status == "succeeded"
+            and chars == 0
+            and reasoning_text
+            and reasoning.get("finish_reason") == "length"
+        ):
+            fallback_text = _REASONING_TRUNCATED_MARKER + "\n\n" + reasoning_text
+            chars = len(fallback_text)
+            warnings.append(
+                "reasoning truncated by max_output_tokens before any content "
+                "was produced; output carries a marker plus the raw reasoning"
+            )
+            # json.dumps escapes; strip the surrounding quotes — same as the
+            # per-chunk yields above, just assembled after the fact.
+            yield json.dumps(fallback_text)[1:-1]
+
         metrics = {
             "run_id": run.id,
             "provider_id": placement.provider.spec.id,
@@ -474,7 +520,8 @@ class ComputeConnectAPI:
             "\", "
             f"\"status\": {json.dumps(status)}, "
             f"\"metrics\": {json.dumps(metrics)}, "
-            f"\"warnings\": {json.dumps(warnings)}"
+            f"\"warnings\": {json.dumps(warnings)}, "
+            f"\"reasoning_content\": {json.dumps(reasoning_text)}"
             "}"
         )
 
@@ -581,6 +628,12 @@ class ComputeConnectAPI:
         # usage (see LlamaCppEngine.stream_chat); a fresh dict per request so
         # concurrent runs never share state.
         real_usage: dict = {}
+        # Same pattern for the upstream's reasoning_content + terminal
+        # finish_reason (reasoning models on this deployment's upstream:
+        # glm-4.7, qwen3.6, gemma-4, gpt-oss). Streaming (SSE) callers do not
+        # get this treatment here — only the non-streaming assembly below
+        # needs it to decide what to put in the single JSON body.
+        reasoning: dict = {}
         upstream = UpstreamStream(
             engine.stream_chat(
                 outcome.model.id,
@@ -588,6 +641,7 @@ class ComputeConnectAPI:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 usage_sink=real_usage,
+                reasoning_sink=reasoning,
             )
         )
 
@@ -631,6 +685,28 @@ class ComputeConnectAPI:
             prompt_tokens = sum(len(str(m.get("content", ""))) // 4 for m in messages)
             completion_tokens = max(1, len(text) // 4)
             total_tokens = prompt_tokens + completion_tokens
+
+        reasoning_text = reasoning.get("text", "")
+        content = text
+        finish_reason = "stop" if status == "succeeded" else "cancelled"
+        # NO-SILENT-EMPTY (see module-level _REASONING_TRUNCATED_MARKER): only
+        # when content is genuinely empty AND the model demonstrably produced
+        # real reasoning AND the upstream's own finish_reason says the budget
+        # ran out mid-thought do we swap in the marker. A normal completed
+        # response (content present) or a response with no reasoning at all
+        # is returned exactly as before. finish_reason is set to "length" to
+        # match — this keeps the OpenAI schema valid (content stays a string,
+        # never null) while making the truncation legible instead of a bare
+        # "".
+        if not content and reasoning_text and reasoning.get("finish_reason") == "length":
+            content = _REASONING_TRUNCATED_MARKER
+            finish_reason = "length"
+        message: dict = {"role": "assistant", "content": content}
+        if reasoning_text:
+            # OpenAI-compatible extension (as served by reasoning-capable
+            # upstreams themselves): expose the real chain-of-thought
+            # alongside content rather than discarding it.
+            message["reasoning_content"] = reasoning_text
         return JSONResponse(
             {
                 "id": f"chatcmpl-{run.id}",
@@ -640,8 +716,8 @@ class ComputeConnectAPI:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop" if status == "succeeded" else "cancelled",
+                        "message": message,
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": {
