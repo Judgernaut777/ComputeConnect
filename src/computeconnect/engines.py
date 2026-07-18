@@ -116,6 +116,7 @@ class LlamaCppEngine:
         max_tokens: int,
         temperature: float,
         usage_sink: dict | None = None,
+        reasoning_sink: dict | None = None,
     ) -> AsyncIterator[str]:
         """Proxy a streaming chat completion, yielding text deltas.
 
@@ -131,6 +132,19 @@ class LlamaCppEngine:
         fresh dict per call keeps concurrent runs from clobbering each
         other's counts. Callers that don't care pass nothing and the field is
         never read.
+
+        ``reasoning_sink`` mirrors ``usage_sink`` for reasoning models
+        (glm-4.7, qwen3.6, gemma-4, gpt-oss on this deployment's upstream):
+        they stream their chain-of-thought as ``delta.reasoning_content`` and
+        only emit ``delta.content`` once thinking finishes. Reasoning text
+        (never yielded as content — it is a separate channel) is accumulated
+        into ``reasoning_sink["text"]``. The sink also carries
+        ``reasoning_sink["finish_reason"]``, the upstream's terminal
+        ``choice.finish_reason`` — callers need this to detect the case where
+        the token budget ran out *while the model was still reasoning*
+        (``finish_reason == "length"`` with empty ``content``), which would
+        otherwise silently look like an empty response. A fresh dict per call
+        avoids cross-request clobbering; callers that don't care pass nothing.
         """
         payload = {
             "model": model,
@@ -159,9 +173,20 @@ class LlamaCppEngine:
                     except ValueError:
                         continue
                     for choice in chunk.get("choices", []):
-                        delta = (choice.get("delta") or {}).get("content")
-                        if delta:
-                            yield delta
+                        delta = choice.get("delta") or {}
+                        content = delta.get("content")
+                        if content:
+                            yield content
+                        # Reasoning text is a distinct channel — accumulated,
+                        # never yielded as content.
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning and reasoning_sink is not None:
+                            reasoning_sink["text"] = (
+                                reasoning_sink.get("text", "") + reasoning
+                            )
+                        finish_reason = choice.get("finish_reason")
+                        if finish_reason and reasoning_sink is not None:
+                            reasoning_sink["finish_reason"] = finish_reason
                     # The real-usage chunk (OpenAI convention) typically has
                     # empty/absent choices and carries only "usage" — check
                     # unconditionally, not just when choices was empty.
@@ -224,11 +249,13 @@ class SimulatedCloudEngine:
         max_tokens: int,
         temperature: float,
         usage_sink: dict | None = None,
+        reasoning_sink: dict | None = None,
     ) -> AsyncIterator[str]:
-        # Simulated: no real upstream usage block to report. usage_sink is
-        # accepted (not populated) purely so callers can treat every engine
-        # identically and exercise the estimate-fallback path against this
-        # engine deliberately.
+        # Simulated: no real upstream usage block to report and no reasoning
+        # channel. usage_sink/reasoning_sink are accepted (not populated)
+        # purely so callers can treat every engine identically — duck-type
+        # parity with LlamaCppEngine — and exercise the estimate-fallback
+        # path against this engine deliberately.
         if self.fail_health:
             raise EngineError("simulated cloud outage")
         self.chat_requests += 1

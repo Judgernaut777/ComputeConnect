@@ -82,6 +82,74 @@ def test_chat_completion_usage_falls_back_to_estimate_with_correct_total(stack):
     assert usage["total_tokens"] > 0
 
 
+def test_chat_completion_reasoning_and_content_both_present(stack):
+    """A reasoning model (glm-4.7/qwen3.6/gemma-4/gpt-oss-shaped) that finishes
+    thinking and then writes a real answer must surface BOTH: content is
+    untouched, and reasoning_content carries the chain-of-thought as an
+    OpenAI-compatible extension — neither is dropped."""
+    stack.upstream.reasoning_response = "1. Analyze the request...\n2. Plan the answer..."
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        json={
+            "model": "fake-llama-7b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+        },
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    message = resp.json()["choices"][0]["message"]
+    assert message["content"].startswith("tok0")
+    assert message["reasoning_content"] == "1. Analyze the request...\n2. Plan the answer..."
+    assert resp.json()["choices"][0]["finish_reason"] == "stop"
+
+
+def test_chat_completion_truncated_mid_reasoning_is_not_a_silent_empty_string(stack):
+    """The bug this whole feature exists to fix: the upstream burned the
+    entire token budget on reasoning and never got to writing `content`
+    (finish_reason == "length", content == ""). The response must NOT be a
+    bare empty string — it must carry a legible marker (and the real
+    reasoning_content), and the request must still succeed at the HTTP
+    layer."""
+    stack.upstream.reasoning_response = "1. Analyze the Request..."
+    stack.upstream.truncate_mid_reasoning = True
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        json={
+            "model": "fake-llama-7b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+        },
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    choice = resp.json()["choices"][0]
+    assert choice["message"]["content"] != ""
+    assert "truncated" in choice["message"]["content"].lower()
+    assert choice["message"]["reasoning_content"] == "1. Analyze the Request..."
+    assert choice["finish_reason"] == "length"
+
+
+def test_chat_completion_no_reasoning_path_is_unchanged(stack):
+    """Baseline: an upstream that never emits reasoning_content produces a
+    response with no reasoning_content key at all — the common case is
+    untouched by this feature."""
+    assert stack.upstream.reasoning_response is None
+    resp = httpx.post(
+        f"{stack.base_url}/v1/chat/completions",
+        json={
+            "model": "fake-llama-7b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+        },
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    message = resp.json()["choices"][0]["message"]
+    assert message["content"].startswith("tok0")
+    assert "reasoning_content" not in message
+
+
 def test_chat_completion_streaming_sse(stack):
     deltas = []
     finish = None

@@ -94,6 +94,58 @@ def test_run_metadata_after_generate(stack):
     assert meta["metrics"]["chunks"] > 0
 
 
+def test_generate_truncated_mid_reasoning_never_stores_an_empty_artifact(stack):
+    """The AgentConnect worker (LocalModelManagerWorkerAdapter) stores this
+    endpoint's "output" field verbatim as an artifact with no guard against
+    emptiness. When the upstream burns its whole token budget on reasoning
+    and never writes real content (finish_reason == "length"), "output" must
+    carry a legible marker plus the real reasoning — never a bare ""."""
+    stack.upstream.reasoning_response = "1. Analyze the Request..."
+    stack.upstream.truncate_mid_reasoning = True
+    resp = httpx.post(
+        f"{stack.base_url}/generate",
+        json={"prompt": "hi", "task_type": "general", "max_output_tokens": 4},
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "succeeded"
+    assert body["output"] != ""
+    assert "truncated" in body["output"].lower()
+    assert "1. Analyze the Request..." in body["output"]
+    assert body["reasoning_content"] == "1. Analyze the Request..."
+
+
+def test_generate_reasoning_with_content_is_unaffected(stack):
+    """Baseline: when the model finishes thinking and produces real content,
+    /generate's `output` is untouched and reasoning_content is exposed
+    alongside it."""
+    stack.upstream.reasoning_response = "1. Analyze the request..."
+    resp = httpx.post(
+        f"{stack.base_url}/generate",
+        json={"prompt": "hi", "task_type": "general", "max_output_tokens": 4},
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["output"].startswith("tok0")
+    assert body["reasoning_content"] == "1. Analyze the request..."
+
+
+def test_generate_no_reasoning_path_is_unchanged(stack):
+    """Baseline: no reasoning_content key semantics change — the field is
+    always present but empty when the upstream never reasons."""
+    resp = httpx.post(
+        f"{stack.base_url}/generate",
+        json={"prompt": "hi", "task_type": "general", "max_output_tokens": 4},
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["output"].startswith("tok0")
+    assert body["reasoning_content"] == ""
+
+
 # --------------------------------------------------------------------------
 # Header/body privacy precedence on the CONTROL PLANE (/generate,
 # /route/estimate). These routes previously read ONLY the body privacy_tier
