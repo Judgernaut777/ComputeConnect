@@ -5,11 +5,11 @@ wiring** — the cross-repo LOW finding from the earlier wave ("AgentConnect con
 attach a `LocalComputeProvider`; memory backends, by contrast, are declared in YAML/ENV").
 
 This document specifies the **declarative surface** so the two sides agree on its shape. The
-consumer change lives in the **AgentConnect** repo (see "Consumer change" at the bottom); nothing in
+consumer change landed in the **AgentConnect** repo (see "Consumer change" at the bottom); nothing in
 this file is code ComputeConnect runs. ComputeConnect already ships the server side of the contract
 (the six `LocalComputeProvider` routes, `docs/CONTRACT.md`).
 
-## The surface AgentConnect should read
+## The surface AgentConnect reads
 
 Mirror the memory-backend pattern in AgentConnect's `bootstrap.py` (`memory_from_env`,
 `config/memory.yaml`): env overrides file, file overrides nothing, absence means the feature is off.
@@ -20,7 +20,7 @@ Mirror the memory-backend pattern in AgentConnect's `bootstrap.py` (`memory_from
 |---|---|
 | `AGENTCONNECT_COMPUTE_URL` | Base URL of a ComputeConnect deployment, e.g. `http://127.0.0.1:8090`. Presence enables the `local_model_manager` worker; absence leaves it unregistered (exactly today's "optional subsystem" semantics). |
 | `AGENTCONNECT_COMPUTE_TIMEOUT` | Optional request timeout in seconds (default 30). |
-| `AGENTCONNECT_COMPUTE_TOKEN` | Optional bearer token, sent as `Authorization`, never logged — mirrors `WIKIBRAIN_TOKEN`. ComputeConnect is unauthenticated on loopback today; this is forward-compat. |
+| `AGENTCONNECT_COMPUTE_TOKEN` | Optional bearer token, sent **verbatim** as `Authorization`, never logged — mirrors `WIKIBRAIN_TOKEN`. ComputeConnect v0.1.0 enforces bearer auth on every route but `/health` when `COMPUTECONNECT_TOKEN` is set (`app._BearerAuthMiddleware`), so the value must then include the `Bearer ` prefix — AgentConnect's `tests/test_compute_bootstrap.py` pins `provider._token == "Bearer sekret"`. |
 
 ### YAML (`config/compute.yaml`, or a `compute:` block alongside `memory:`)
 
@@ -48,7 +48,7 @@ same way a bad `memory:` block does — a missing compute plane is a smaller pro
 Exactly what it builds today, but from config instead of code:
 
 ```python
-# sketch for AgentConnect bootstrap.py — belongs in the AgentConnect repo.
+# sketch for AgentConnect bootstrap.py — now shipped in the AgentConnect repo.
 from agentconnect.core.local_compute import (
     HttpLocalComputeProvider, LocalModelManagerWorkerAdapter,
 )
@@ -62,8 +62,9 @@ def compute_worker_from_env():
 ```
 
 `HttpLocalComputeProvider` and `LocalModelManagerWorkerAdapter` **already exist** in
-`agentconnect/core/local_compute.py`; only the *wiring from config* is missing. No ComputeConnect
-change is needed for any of this — its routes already conform.
+`agentconnect/core/local_compute.py`, and the *wiring from config* has shipped too (2026-07-17):
+`compute_worker_from_env()` in AgentConnect's `bootstrap.py` builds exactly this. No ComputeConnect
+change was needed for any of this — its routes already conform.
 
 ## Privacy-tier vocabulary agreement
 
@@ -73,14 +74,16 @@ by a test (`tests/test_privacy.py::TestPrivacyPrecedence::test_strictness_mirror
 so a drift on either side fails CI. The header/body **precedence** rule (more restrictive wins) is in
 `docs/CONTRACT.md`; AgentConnect callers that set only `subtask.privacy_tier` are unaffected.
 
-## Consumer change — for the lead (sibling repo, not this one)
+## Consumer change — landed in the sibling repo (2026-07-17)
 
-The only change needed to close the finding lives in **`mcp-agentconnect`**:
+The change that closed the finding lives in **`mcp-agentconnect`**, and all of it has shipped:
 
-1. Add `compute_worker_from_env()` (above) to `packages/agentconnect-core/src/agentconnect/core/bootstrap.py`.
-2. Append its result (if not `None`) to the worker list in `service_from_env`.
-3. Add `config/compute.yaml` (example above) and read it with the same `yaml.safe_load` +
-   env-override pattern as `_load_memory_yaml`.
-4. A degrade-to-off-on-malformed test, matching the memory backend's.
+1. `compute_worker_from_env()` (above) is in `packages/agentconnect-core/src/agentconnect/core/bootstrap.py`.
+2. Its result (when not `None`) is appended to the worker list in `service_from_env`.
+3. `config/compute.yaml.example` ships (example above); `config/compute.yaml` is read with the same
+   `yaml.safe_load` + env-override pattern as `_load_memory_yaml`.
+4. The degrade-to-off-on-malformed test is
+   `tests/test_compute_bootstrap.py::test_malformed_yaml_degrades_to_off`, matching the memory backend's.
 
-No wire-format or ComputeConnect-server change is implied. This file is the agreed shape.
+No wire-format or ComputeConnect-server change was implied. This file is the agreed shape, now
+implemented on both sides.
