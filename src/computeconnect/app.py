@@ -70,6 +70,39 @@ _REASONING_TRUNCATED_MARKER = (
     "[truncated: model was still reasoning; increase max_tokens]"
 )
 
+
+class _BadNumericField(ValueError):
+    """A request numeric field held a truthy-but-non-numeric value.
+
+    Handlers catch this and return their layer's structured 400 instead of
+    letting a bare ``int()``/``float()`` raise an unhandled 500.
+    """
+
+    def __init__(self, key: str, raw: object) -> None:
+        self.key = key
+        self.raw = raw
+        super().__init__(f"'{key}' must be a number, got {raw!r}")
+
+
+def _int_field(body: dict, key: str, default: int) -> int:
+    """Coerce ``body[key]`` to ``int``, preserving the historical
+    ``body.get(key) or default`` fall-through for falsy values and raising
+    :class:`_BadNumericField` on a truthy-but-non-numeric value."""
+    raw = body.get(key) or default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise _BadNumericField(key, body.get(key))
+
+
+def _float_field(body: dict, key: str, default: float) -> float:
+    """``float`` counterpart of :func:`_int_field`."""
+    raw = body.get(key) or default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise _BadNumericField(key, body.get(key))
+
 #: Hosts that keep the surface off the network. A bind to anything else exposes
 #: an unauthenticated inference + cancellation surface, so it must carry a
 #: bearer token. Shared by the CLI's pre-flight check and enforced again in
@@ -352,14 +385,17 @@ class ComputeConnectAPI:
             request.headers.get("x-privacy-tier"), body.get("privacy_tier")
         )
         candidates = await self._candidates_resolved(privacy)
-        workload = WorkloadSpec(
-            model=body.get("model") or None,
-            required_capabilities=tuple(body.get("required_capabilities") or ()),
-            context_tokens=int(body.get("context_tokens") or 0),
-            max_output_tokens=int(body.get("max_output_tokens") or 0),
-            latency_preference=str(body.get("latency_preference") or "normal"),
-            quality_preference=str(body.get("quality_preference") or "good_enough"),
-        )
+        try:
+            workload = WorkloadSpec(
+                model=body.get("model") or None,
+                required_capabilities=tuple(body.get("required_capabilities") or ()),
+                context_tokens=_int_field(body, "context_tokens", 0),
+                max_output_tokens=_int_field(body, "max_output_tokens", 0),
+                latency_preference=str(body.get("latency_preference") or "normal"),
+                quality_preference=str(body.get("quality_preference") or "good_enough"),
+            )
+        except _BadNumericField as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(
             estimate(candidates, workload, max_snapshot_age=self._max_snapshot_age)
         )
@@ -383,13 +419,20 @@ class ComputeConnectAPI:
             request.headers.get("x-privacy-tier"), body.get("privacy_tier")
         )
         candidates = await self._candidates_resolved(privacy)
-        workload = WorkloadSpec(
-            model=body.get("model") or None,
-            max_output_tokens=int(body.get("max_output_tokens") or 0),
-            context_tokens=int(body.get("context_tokens") or 0),
-            latency_preference=str(body.get("latency_preference") or "normal"),
-            quality_preference=str(body.get("quality_preference") or "good_enough"),
-        )
+        try:
+            workload = WorkloadSpec(
+                model=body.get("model") or None,
+                max_output_tokens=_int_field(body, "max_output_tokens", 0),
+                context_tokens=_int_field(body, "context_tokens", 0),
+                latency_preference=str(body.get("latency_preference") or "normal"),
+                quality_preference=str(body.get("quality_preference") or "good_enough"),
+            )
+            # temperature is consumed downstream in the streamed body
+            # (_generate_stream); validate it here so a malformed value returns a
+            # structured 400 rather than raising mid-stream after the run starts.
+            _float_field(body, "temperature", 0.0)
+        except _BadNumericField as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         outcome = select_placement(
             candidates, workload, max_snapshot_age=self._max_snapshot_age
         )
@@ -421,8 +464,11 @@ class ComputeConnectAPI:
         """Emit one JSON document incrementally; final status decided at the end."""
         engine = placement.provider.spec.engine
         model = placement.model
-        max_tokens = int(body.get("max_output_tokens") or 2048)
-        temperature = float(body.get("temperature") or 0.0)
+        # Already validated in generate() before the run/stream started; the
+        # helpers keep the coercion guarded here too so this generator can never
+        # raise an unhandled error mid-stream.
+        max_tokens = _int_field(body, "max_output_tokens", 2048)
+        temperature = _float_field(body, "temperature", 0.0)
 
         yield (
             "{"
@@ -474,11 +520,31 @@ class ComputeConnectAPI:
             warnings.append(f"upstream engine error: {exc}")
         finally:
             await upstream.aclose()  # closes the upstream connection: propagates cancel
+            # The NO-SILENT-EMPTY fallback below rewrites `output` (and thus the
+            # streamed output_chars) after this finally runs, but finish() is
+            # idempotent and cannot be re-called once terminal — so fold that
+            # same correction into the persisted metrics here (the engine has
+            # already populated `reasoning` in place). This keeps GET /runs/{id}
+            # in agreement with the streamed metrics. `chars` is intentionally
+            # left untouched so the fallback block below still fires and emits
+            # the marker; only the persisted value is reconciled. Note chunks
+            # stays 0 in both records — only output_chars diverged.
+            persisted_chars = chars
+            _reasoning_text = reasoning.get("text", "")
+            if (
+                status == "succeeded"
+                and chars == 0
+                and _reasoning_text
+                and reasoning.get("finish_reason") == "length"
+            ):
+                persisted_chars = len(
+                    _REASONING_TRUNCATED_MARKER + "\n\n" + _reasoning_text
+                )
             self.runs.finish(
                 run,
                 status,
                 chunks=chunks,
-                output_chars=chars,
+                output_chars=persisted_chars,
                 duration_seconds=round(time.time() - started, 4),
             )
 
@@ -618,11 +684,18 @@ class ComputeConnectAPI:
                 code="model_not_found",
             )
 
+        try:
+            raw_max = body.get("max_tokens") or body.get("max_completion_tokens") or 2048
+            try:
+                max_tokens = int(raw_max)
+            except (TypeError, ValueError):
+                raise _BadNumericField("max_tokens", body.get("max_tokens"))
+            temperature = _float_field(body, "temperature", 0.0)
+        except _BadNumericField as exc:
+            return self._openai_error(str(exc), "invalid_request_error", 400)
         run = self.runs.create(
             provider_id=outcome.provider.spec.id, model=outcome.model.id, surface="openai"
         )
-        max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
-        temperature = float(body.get("temperature") or 0.0)
         engine = outcome.provider.spec.engine
         # Mutated in place by the engine if/when the upstream reports real
         # usage (see LlamaCppEngine.stream_chat); a fresh dict per request so

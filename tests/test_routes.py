@@ -116,6 +116,56 @@ def test_generate_truncated_mid_reasoning_never_stores_an_empty_artifact(stack):
     assert body["reasoning_content"] == "1. Analyze the Request..."
 
 
+def test_generate_truncated_mid_reasoning_reconciles_run_journal_metrics(stack):
+    """The reasoning-truncated fallback rewrites `output` after runs.finish has
+    already persisted output_chars=0. The durable journal (GET /runs/{id}) must
+    be reconciled to agree with the streamed metrics: a run that returned N
+    chars must not be recorded as having produced 0."""
+    stack.upstream.reasoning_response = "1. Analyze the Request..."
+    stack.upstream.truncate_mid_reasoning = True
+    resp = httpx.post(
+        f"{stack.base_url}/generate",
+        json={"prompt": "hi", "task_type": "general", "max_output_tokens": 4},
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    streamed_chars = body["metrics"]["output_chars"]
+    assert streamed_chars == len(body["output"]) > 0
+    run_id = resp.headers["X-Run-Id"]
+    meta = httpx.get(f"{stack.base_url}/runs/{run_id}", timeout=10).json()
+    assert meta["state"] == "succeeded"
+    # The journal must match the streamed metrics, not the pre-fallback 0.
+    assert meta["metrics"]["output_chars"] == streamed_chars
+
+
+def test_route_estimate_non_numeric_context_tokens_is_400(stack):
+    """A truthy-but-non-numeric numeric field must return a structured 400,
+    not propagate an unhandled int() ValueError as a bare 500."""
+    resp = httpx.post(
+        f"{stack.base_url}/route/estimate",
+        json={"task_type": "general", "context_tokens": "big"},
+        timeout=10,
+    )
+    assert resp.status_code == 400
+    assert "context_tokens" in resp.json()["error"]
+
+
+def test_generate_non_numeric_numeric_fields_are_400(stack):
+    """/generate must reject a non-numeric max_output_tokens or temperature with
+    a structured 400 before starting the run/stream — not 500."""
+    for field, value in (("max_output_tokens", "big"), ("temperature", "hot")):
+        resp = httpx.post(
+            f"{stack.base_url}/generate",
+            json={"prompt": "hi", "task_type": "general", field: value},
+            timeout=10,
+        )
+        assert resp.status_code == 400, (field, resp.status_code)
+        assert field in resp.json()["error"]
+    # No run leaked from either rejected request.
+    assert stack.api.runs.active_count("local-llamacpp") == 0
+
+
 def test_generate_reasoning_with_content_is_unaffected(stack):
     """Baseline: when the model finishes thinking and produces real content,
     /generate's `output` is untouched and reasoning_content is exposed
