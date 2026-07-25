@@ -257,3 +257,26 @@ def test_openai_invalid_body_is_400(stack):
         f"{stack.base_url}/v1/chat/completions", json={"model": "x"}, timeout=10
     )
     assert resp.status_code == 400
+
+
+def test_openai_non_numeric_fields_are_structured_400_not_500(stack):
+    """A truthy-but-non-numeric temperature/max_tokens must return the OpenAI
+    layer's own invalid_request_error 400 — not propagate an unhandled
+    float()/int() ValueError as a bare 500. No run is created for the bad
+    request either (the coercion happens before runs.create)."""
+    base = {
+        "model": "fake-llama-7b",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    for field, value in (("temperature", "hot"), ("max_tokens", "lots")):
+        resp = httpx.post(
+            f"{stack.base_url}/v1/chat/completions",
+            json={**base, field: value},
+            timeout=10,
+        )
+        assert resp.status_code == 400, (field, resp.status_code)
+        err = resp.json()["error"]
+        assert err["type"] == "invalid_request_error"
+        assert field in err["message"]
+    # No run leaked from either rejected request.
+    assert stack.api.runs.active_count("local-llamacpp") == 0
