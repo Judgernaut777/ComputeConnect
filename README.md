@@ -26,8 +26,10 @@ python3 -m venv .venv && .venv/bin/pip install -e .   # or: uv pip install -e .
   providers are filtered before placement and refusals are structured, never silent downgrades.
 
 Tests: `.venv/bin/python -m pytest` (installs `pytest` via `pip install -e .[dev]`; real-engine
-tests skip when no llama.cpp is reachable on `:8080`). 140 tests total, 129 of them fully offline;
-see [docs/STATUS.md](docs/STATUS.md) for the current pass count and the real-engine caveat.
+tests skip when no llama.cpp is reachable on `:8080`, and the two-engine subset also skips when no
+second engine is reachable on `:8091` via `scripts/second_engine.sh`). 154 tests total, 143 of them
+fully offline; see [docs/STATUS.md](docs/STATUS.md) for the current pass count and the real-engine
+caveat.
 
 ---
 
@@ -84,8 +86,14 @@ ComputeConnect.
 
 ## Status at a glance
 
-A minimal runtime exists (v0.1.0). One real compute node exists; the second provider is
-simulated, and the heterogeneity premise is therefore still **unproven** — stated plainly in
+A minimal runtime exists (v0.1.0). Two real compute nodes now exist on this host — a 35B MoE
+engine and a 4B dense engine, differing in family, size, and context window — and single-host
+heterogeneous placement across them is **PROVEN** as of 2026-07-27 (real preference-driven
+selection, capacity-forced placement, and real generation from both engines; see
+[docs/validation/heterogeneity-2026-07-27.md](docs/validation/heterogeneity-2026-07-27.md)).
+The simulated cloud provider still exists for the privacy default-deny path only and is never
+cited as heterogeneity evidence. What remains open is **cross-machine** heterogeneity — a node of
+a different physical machine, starting with the GPU-class box on this network — stated plainly in
 [STATUS.md](docs/STATUS.md).
 
 | Deliverable | State |
@@ -95,7 +103,7 @@ simulated, and the heterogeneity premise is therefore still **unproven** — sta
 | AgentConnect contract | **Conformed to and tested with AgentConnect's shipped client**, including against the real local engine |
 | BrainConnect contract | Drafted — a compute consumer on the inference API, not a peer scheduler; nothing rewired yet |
 | ToolConnect contract | **Provisional** — validated runtime but no compute-facing surface yet |
-| Code | `computeconnect` 0.1.0: both API layers, structural privacy, streaming + cancellation, 140 tests (129 offline + 11 real-engine) |
+| Code | `computeconnect` 0.1.0: both API layers, structural privacy, streaming + cancellation, real single-host two-engine heterogeneous placement, 154 tests (143 offline + 11 real-engine) |
 | Decisions | **D1–D6 all ratified** — implementation status per decision in [STATUS.md](docs/STATUS.md) |
 | License | **Apache-2.0** |
 
