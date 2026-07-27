@@ -123,8 +123,15 @@ with no placement problem in sight, `llama-swap` is the maintained answer and sh
 
 ## Phase 4 — The second provider
 
-The cross-host premise is currently **untested**, because exactly one provider exists. Until a
-second one does, every claim about heterogeneity in ARCHITECTURE is theory.
+**Update, 2026-07-27:** the single-host half of this phase is done — a second real provider
+(`:8091`, Qwen3-4B dense / 8k ctx, alongside the reference `:8080` 35B-A3B MoE / 16k ctx) is
+registered, and placement across the two is **PROVEN** live (preference-driven selection,
+capacity-forced placement, real generation from both — see
+[docs/validation/heterogeneity-2026-07-27.md](validation/heterogeneity-2026-07-27.md)). The
+**cross-host** premise below remains untested: both providers proven so far share one physical box.
+Until a provider on a genuinely different machine is registered and a placement decision is made
+across it, the cross-machine claim in ARCHITECTURE is still theory — the rest of this phase's
+scope (remote/containerized providers) is still open.
 
 Testing it does **not** require buying hardware. The requirement is **two logically distinct
 providers differing in capability or policy**, where one may be simulated, containerized, remote, or

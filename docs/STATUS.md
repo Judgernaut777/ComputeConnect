@@ -1,6 +1,6 @@
 # Status
 
-**Last updated:** 2026-07-12
+**Last updated:** 2026-07-27
 
 Read this before proposing work. It is the honest version.
 
@@ -19,14 +19,14 @@ A minimal but real runtime: the `computeconnect` Python package, **v0.1.0**.
 | `/generate` streaming (D3) | Implemented: incremental single-JSON-document stream, one-delta backpressure, cancellation propagates to the upstream engine (verified: the upstream sees the disconnect mid-generation). |
 | Structural privacy (D5) | Implemented as a staged pipeline: `resolve_privacy_tier` defaults closed, `filter_candidates` is the only constructor of the `CandidateSet` type, and placement/estimate accept only a `CandidateSet`. Cloud is filtered **before** placement; empty set ⇒ structured refusal. |
 | Amendments | **CA-1** (optional `privacy_tier` on `/generate`, absent ⇒ most restrictive, positive re-verify) and **CA-3** (`run_id` in body + `X-Run-Id` header) implemented; see [CONTRACT.md](CONTRACT.md). CA-2 remains proposed. |
-| Providers registered by default | Two: the local llama.cpp host (read-only upstream on `:8080`; ComputeConnect never manages its lifecycle) and a **simulated** cloud provider (in-process, distinct placement class `cloud`, distinct capabilities and capacity). A **second real engine** (Qwen3-4B / 8k ctx on `:8091`, `scripts/second_engine.sh`) can be registered via the config surface for real heterogeneous placement — see the D2 re-eval. |
+| Providers registered by default | Two: the local llama.cpp host (read-only upstream on `:8080`; ComputeConnect never manages its lifecycle) and a **simulated** cloud provider (in-process, distinct placement class `cloud`, distinct capabilities and capacity). A **second real engine** (Qwen3-4B / 8k ctx on `:8091`, `scripts/second_engine.sh`) can be registered via the config surface for real (single-host) heterogeneous placement — see the D2 re-eval. |
 | Placement preference | `latency_preference` (fastest) / `quality_preference` (highest) select between same-class nodes; hard constraints (capability, context-window fit) always win. `reason.considered` lists the candidate set. Default order (local → loaded → queue) unchanged. |
 | Privacy header/body precedence | When both `X-Privacy-Tier` and body `privacy_tier` are present, the **more restrictive** wins; a header can never widen a more-restrictive body. `PRIVACY_STRICTNESS` byte-mirrors AgentConnect's (test-asserted). |
 | Run persistence / restart | Optional SQLite run journal (`--run-journal`): in-flight runs orphaned by a crash are reconciled to terminal `interrupted` on restart, never lost/dangling; queryable via `GET /runs/{id}`. `/health` reports `persistence`. Default is in-memory. |
 | Staleness | Fail-closed `max_snapshot_age` ceiling: a snapshot older than the bound is rejected at a `stale` stage, never trusted for placement; a stale snapshot can never cause a privacy-wrong cloud placement (privacy is structural on `placement_class`). |
 | Config surface | `--config` / `COMPUTECONNECT_CONFIG` (JSON always; YAML with the `config` extra) declares providers without code. `docs/AGENTCONNECT_INTEGRATION.md` specifies the AgentConnect-side `AGENTCONNECT_COMPUTE_URL` / `compute:` yaml shape (consumer change is a sibling-repo task). |
 | Tests | 154 pytest tests (143 offline + 11 real-engine): privacy property + precedence tests, placement (incl. preference + staleness), all six routes over real HTTP (uvicorn on ephemeral ports, not an in-process shim), streaming/backpressure/cancellation/disconnect, OpenAI layer, fault injection + failover, run-journal restart reconciliation, config surface, conformance driven by AgentConnect's **shipped** `HttpLocalComputeProvider`, and real-engine tests including **two real engines** (`:8080` 35B + `:8091` 4B) that skip — never fake — when an engine is unreachable. |
-| Gate | `cd ComputeConnect && .venv/bin/python -m pytest` — **149 passed, 5 skipped** on 2026-07-27 against the live `:8080` engine. The 2026-07-17 environmental failure (tests hardcoded the model id `qwen3-30b-a3b` after the host's `:8080` model was renamed `qwen3.6-35b-a3b` on 2026-07-13) is fixed: `test_real_engine.py` reads the expected ids from `CC_REAL_MODEL` / `CC_REAL_MODEL_B` (defaults match the current host) instead of hardcoding them. The 5 skips are the two-engine heterogeneity tests — `:8091` was not running; they skip, never fake. |
+| Gate | `cd ComputeConnect && .venv/bin/python -m pytest` — **154 passed, 0 skipped** on 2026-07-27, run with both `:8080` and `:8091` live. The 2026-07-17 environmental failure (tests hardcoded the model id `qwen3-30b-a3b` after the host's `:8080` model was renamed `qwen3.6-35b-a3b` on 2026-07-13) is fixed: `test_real_engine.py` reads the expected ids from `CC_REAL_MODEL` / `CC_REAL_MODEL_B` (defaults match the current host) instead of hardcoding them. All five two-engine heterogeneity tests **passed for real** rather than skipping — see [docs/validation/heterogeneity-2026-07-27.md](validation/heterogeneity-2026-07-27.md) for the verbatim run. (An earlier run that day, with `:8091` not yet started, showed 149 passed / 5 skipped — those 5 are the same two-engine tests, which skip, never fake, whenever the second engine is down.) |
 
 ## What was verified, on this host, 2026-07-12
 
@@ -70,42 +70,55 @@ The ratified condition: *abandon if only a single homogeneous host is demonstrat
 single-node software already solves the use case.*
 
 **What changed since the last re-eval:** a **second real engine** now runs on this box —
-Qwen3-4B dense / 8k context on `:8091`, alongside the reference Qwen3-30B-A3B MoE / 16k context on
+Qwen3-4B dense / 8k context on `:8091`, alongside the reference Qwen3.6-35B-A3B MoE / 16k context on
 `:8080` (`scripts/second_engine.sh`). Both are real CPU inference. This lets us re-run D2 against
 *real* heterogeneity instead of a simulation.
 
-**What is now demonstrated (real, not simulated):** a genuine heterogeneous placement decision.
-With both real engines registered, the SAME workload class is placed on:
+**PROVEN, 2026-07-27 (single-host, two-engine case):** a genuine heterogeneous placement decision,
+run live against both real engines, not merely demonstrated in a one-off demo. With both engines
+up, the full gate was executed and every two-engine test **passed** — the SAME workload class is
+placed on:
 
-* the 4B node under a `latency_preference` (it is ~7-18× faster to first token here),
-* the 30B node under a `quality_preference` (higher declared quality),
-* the 30B node for a 12k-token context the 4B's 8k window cannot fit (capacity/capability),
+* the 4B node under a `latency_preference`,
+* the 35B-A3B node under a `quality_preference`,
+* the 35B-A3B node for a 12k-token context the 4B's 8k window cannot fit (capacity/capability),
 
-with **real generations from both engines** and a **real failover** (kill the 4B, the latency job
-moves to the 30B and still generates). Evidence:
-`scratchpad/waveA/ComputeConnect/demo_two_real_engines.py` (end-to-end, real HTTP) and
-`tests/test_real_engine.py::test_*two_real_engines*` / `*real_generation_from_BOTH*` (skip, never
-fake, when either engine is down). So the placement policy is not merely non-trivial — it makes a
-decision **on real hardware that a static request router cannot make**, because the choice depends on
-live per-node latency/quality/context-fit. That is the "validates the premise" bar from the previous
-re-eval, and it is now met **for the single-box, multi-engine case**.
+with **real generations from both engines**, confirmed by the exact test names and verbatim
+`pytest` output in
+[docs/validation/heterogeneity-2026-07-27.md](validation/heterogeneity-2026-07-27.md)
+(`test_two_real_engines_both_visible`, `test_latency_preference_selects_the_fast_real_engine`,
+`test_quality_preference_selects_the_accurate_real_engine`,
+`test_large_context_only_fits_the_big_window_engine`,
+`test_real_generation_from_BOTH_engines` — all PASSED, none skipped). These live behind the
+`hetero_stack` fixture in `tests/test_real_engine.py` and **skip, never fake, when `:8091` is
+down**; on 2026-07-27 they did not skip. So the placement policy is not merely non-trivial — it
+makes a decision **on real hardware that a static request router cannot make**, because the
+choice depends on live per-node latency/quality/context-fit. That is the "validates the premise"
+bar from the previous re-eval, and it is now **proven, not just demonstrated once**, for the
+single-box, multi-engine case.
 
-**What is still NOT demonstrated:** *cross-hardware-class* heterogeneity. There is still exactly one
-physical node and no accelerator. Both engines are CPU llama.cpp on the same box, so the demo does
-not prove value for the case ComputeConnect was most ambitiously pitched at — routing between, say, a
-local GPU and a rented one, or a Mac where `gpu_requires_host_process` holds. A determined operator
-could approximate the single-box, two-engine value today with **llama-swap + LiteLLM** or
-**LocalAI**; where those fall short is the six-route control-plane contract (estimate/refusal
-semantics, structural default-deny privacy tiers, run cancellation, run persistence) exposed
-*alongside* the OpenAI surface — which remains ComputeConnect's distinct value.
+**What is still NOT demonstrated:** *cross-hardware-class* — and specifically *cross-machine* —
+heterogeneity. There is still exactly one physical node in this proof and no accelerator. Both
+engines are CPU llama.cpp on the same box, so the proof does not yet cover the case ComputeConnect
+was most ambitiously pitched at — routing between, say, a local GPU and a rented one, or a
+different physical machine entirely. A real GPU-class box (the Radeon R9700) exists on this
+network today, but it is reachable only from the `192.168.34.55` agent host via a reverse SSH
+tunnel into ComputeConnect's upstream — not yet registered as a ComputeConnect provider, and no
+placement decision has been made across it. That is the next, still-open step; see the Honest
+scope section of the validation doc linked above. A determined operator could approximate the
+single-box, two-engine value today with **llama-swap + LiteLLM** or **LocalAI**; where those fall
+short is the six-route control-plane contract (estimate/refusal semantics, structural default-deny
+privacy tiers, run cancellation, run persistence) exposed *alongside* the OpenAI surface — which
+remains ComputeConnect's distinct value.
 
 **Verdict:** not the abandonment case, and now for a stronger reason than last time. Previously the
-multi-node value claim was "unmade, not disproven"; it is now **partially made** — real single-box
-heterogeneous placement is demonstrated and reproducible — while the cross-hardware-class claim
-stays honestly unmade. ComputeConnect earns its keep as (a) the conformance implementation of the
-Connect compute contract and (b) a real, if modest, heterogeneous placement engine within one host.
-The simulated cloud provider remains for exercising the cloud default-deny path and **must still
-never be cited as evidence of heterogeneity** — that evidence now comes from the two real engines.
+multi-node value claim was "unmade, not disproven"; single-host, two-engine heterogeneous
+placement is now **proven** (live run, 2026-07-27) and reproducible on demand — while the
+cross-machine claim stays honestly unmade and open. ComputeConnect earns its keep as (a) the
+conformance implementation of the Connect compute contract and (b) a real, if modest, heterogeneous
+placement engine within one host. The simulated cloud provider remains for exercising the cloud
+default-deny path and **must still never be cited as evidence of heterogeneity** — that evidence
+now comes from the two real engines.
 
 **What would still settle the remaining claim:** a real node of a *different hardware class* arrives
 and placement across it delivers a decision a static config could not — validating the full premise —
@@ -122,7 +135,7 @@ Full text in [ARCHITECTURE.md §8](ARCHITECTURE.md#8-decisions). D1–D2 on 2026
 | # | Decision | v0.1.0 |
 |---|---|---|
 | **D1** | Provider = compute environment, not LLM-API provider | Held: providers are compute environments (two real llama.cpp engines of different shape + a simulated cloud); no LiteLLM replacement built. |
-| **D2** | Design-validation rule | Re-evaluated above after a real second engine: single-box heterogeneous placement now **demonstrated**; cross-hardware-class value still unmade. |
+| **D2** | Design-validation rule | Re-evaluated above after a real second engine: single-box heterogeneous placement now **PROVEN** (live gate, 2026-07-27); cross-machine value still unmade. |
 | **D3** | `/generate` thin streaming proxy | Implemented and tested (streaming, backpressure via one-delta pull, cancellation, disconnect). |
 | **D4** | Two APIs, one backend | Implemented: both layers share one registry, one run tracker, one generation path per engine. |
 | **D5** | Structural default-deny privacy | Implemented as pipeline structure, tested including local-down/cloud-capable hard cases. |
