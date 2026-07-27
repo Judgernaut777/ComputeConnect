@@ -1,15 +1,16 @@
-"""Against the real llama.cpp engine on :8080 (the wiki-llama systemd unit).
+"""Against the real llama.cpp engine on :8080 (the qwen36-msr1 systemd unit).
 
 Read-only consumption: these tests never load, unload, or reconfigure
 anything. They skip — not fail — when the engine is unreachable.
 
-The generation tests are real CPU inference on a 30B MoE model: they are kept
+The generation tests are real CPU inference on a 35B MoE model: they are kept
 tiny (a handful of output tokens) but still take seconds.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import httpx
@@ -23,10 +24,17 @@ from conftest import ServerHandle
 
 REAL_UPSTREAM = "http://127.0.0.1:8080"
 #: A SECOND real engine of a materially different shape: a 4B dense model with
-#: an 8k context window, vs the 30B MoE / 16k window on :8080. Stand it up with
+#: an 8k context window, vs the 35B MoE / 16k window on :8080. Stand it up with
 #:   scripts/second_engine.sh   (or the Wave-A demo runner). Tests that need it
 #: skip when it is absent — they never fake heterogeneity.
 REAL_UPSTREAM_B = "http://127.0.0.1:8091"
+
+#: Model ids llama.cpp reports for each engine. These follow the HOST's
+#: deployment, not the product: when the served model is renamed or swapped
+#: (as qwen3-30b-a3b -> qwen3.6-35b-a3b was on 2026-07-13), update the default
+#: here or override via the environment — the tests themselves are model-agnostic.
+REAL_MODEL = os.environ.get("CC_REAL_MODEL", "qwen3.6-35b-a3b")
+REAL_MODEL_B = os.environ.get("CC_REAL_MODEL_B", "qwen3-4b")
 
 
 def _up(url: str) -> bool:
@@ -69,8 +77,8 @@ def real_stack():
 def test_real_models_inventory(real_stack):
     body = httpx.get(f"{real_stack}/models", timeout=15).json()
     ids = {m["id"] for m in body["models"]}
-    assert "qwen3-30b-a3b" in ids
-    model = next(m for m in body["models"] if m["id"] == "qwen3-30b-a3b")
+    assert REAL_MODEL in ids
+    model = next(m for m in body["models"] if m["id"] == REAL_MODEL)
     assert model["context_tokens"] > 0
     assert model["loaded"] is True
     assert model["runtime"] == "llama.cpp"
@@ -89,7 +97,7 @@ def test_real_estimate_eligible(real_stack):
         timeout=15,
     ).json()
     assert body["eligible"] is True
-    assert body["selected_model"] == "qwen3-30b-a3b"
+    assert body["selected_model"] == REAL_MODEL
 
 
 def test_real_generate_small(real_stack):
@@ -107,7 +115,7 @@ def test_real_generate_small(real_stack):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "succeeded"
-    assert body["model"] == "qwen3-30b-a3b"
+    assert body["model"] == REAL_MODEL
     assert body["metrics"]["chunks"] > 0
     assert body["output"].strip()
 
@@ -161,7 +169,7 @@ def test_real_shipped_agentconnect_client_phase1_gate(real_stack):
     provider = local_compute.HttpLocalComputeProvider(real_stack, timeout=30.0)
     assert provider.health()["status"] == "ok"
     inventory = provider.inventory()
-    assert "qwen3-30b-a3b" in {m.id for m in inventory}
+    assert REAL_MODEL in {m.id for m in inventory}
     assert {m.id for m in provider.loaded()} == {m.id for m in inventory}
     estimate = provider.estimate(
         local_compute.LocalEstimateRequest(
@@ -173,14 +181,14 @@ def test_real_shipped_agentconnect_client_phase1_gate(real_stack):
         )
     )
     assert estimate.eligible is True
-    assert estimate.selected_model == "qwen3-30b-a3b"
+    assert estimate.selected_model == REAL_MODEL
 
 
 def test_real_openai_layer_small(real_stack):
     resp = httpx.post(
         f"{real_stack}/v1/chat/completions",
         json={
-            "model": "qwen3-30b-a3b",
+            "model": REAL_MODEL,
             "messages": [
                 {"role": "user", "content": "Reply with the single word OK."}
             ],
@@ -199,7 +207,7 @@ def test_real_openai_layer_small(real_stack):
 
 _two_engines = pytest.mark.skipif(
     not (_up(REAL_UPSTREAM) and _up(REAL_UPSTREAM_B)),
-    reason=f"needs BOTH real engines ({REAL_UPSTREAM} 30B/16k and "
+    reason=f"needs BOTH real engines ({REAL_UPSTREAM} 35B/16k and "
     f"{REAL_UPSTREAM_B} 4B/8k); start the second with scripts/second_engine.sh",
 )
 
@@ -207,7 +215,7 @@ _two_engines = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def hetero_stack():
     """ComputeConnect fronting two REAL, materially-different local engines:
-    the 30B MoE (higher quality, slower, 16k ctx) and the 4B dense (faster,
+    the 35B MoE (higher quality, slower, 16k ctx) and the 4B dense (faster,
     lower quality, 8k ctx). Declared quality/tps reflect that reality."""
     config = AppConfig(
         providers=[
@@ -242,7 +250,7 @@ def hetero_stack():
 @_two_engines
 def test_two_real_engines_both_visible(hetero_stack):
     ids = {m["id"] for m in httpx.get(f"{hetero_stack}/models", timeout=15).json()["models"]}
-    assert {"qwen3-30b-a3b", "qwen3-4b"} <= ids
+    assert {REAL_MODEL, REAL_MODEL_B} <= ids
 
 
 @_two_engines
@@ -260,7 +268,7 @@ def test_latency_preference_selects_the_fast_real_engine(hetero_stack):
         timeout=15,
     ).json()
     assert body["eligible"] is True
-    assert body["selected_model"] == "qwen3-4b"  # the fast 4B node
+    assert body["selected_model"] == REAL_MODEL_B  # the fast 4B node
     assert body["reason"]["provider_id"] == "local-4b"
 
 
@@ -279,13 +287,13 @@ def test_quality_preference_selects_the_accurate_real_engine(hetero_stack):
         timeout=15,
     ).json()
     assert body["eligible"] is True
-    assert body["selected_model"] == "qwen3-30b-a3b"  # the accurate 30B node
+    assert body["selected_model"] == REAL_MODEL  # the accurate 35B node
     assert body["reason"]["provider_id"] == "local-30b"
 
 
 @_two_engines
 def test_large_context_only_fits_the_big_window_engine(hetero_stack):
-    """A context beyond the 4B node's 8k window must place on the 30B/16k node
+    """A context beyond the 4B node's 8k window must place on the 35B/16k node
     even under a latency preference — real capacity/capability placement."""
     body = httpx.post(
         f"{hetero_stack}/route/estimate",
@@ -300,14 +308,14 @@ def test_large_context_only_fits_the_big_window_engine(hetero_stack):
         timeout=15,
     ).json()
     assert body["eligible"] is True
-    assert body["selected_model"] == "qwen3-30b-a3b"
+    assert body["selected_model"] == REAL_MODEL
 
 
 @_two_engines
 def test_real_generation_from_BOTH_engines(hetero_stack):
     """Real CPU inference from each of the two real engines, selected by
     pinning the model — proof that both actually run, not one plus a sim."""
-    for model in ("qwen3-4b", "qwen3-30b-a3b"):
+    for model in (REAL_MODEL_B, REAL_MODEL):
         resp = httpx.post(
             f"{hetero_stack}/v1/chat/completions",
             json={
