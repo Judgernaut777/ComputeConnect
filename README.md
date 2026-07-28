@@ -129,4 +129,5 @@ single-node systems — LocalAI, llama-swap, Ollama, LiteLLM — over building C
 * [docs/CONTRACT.md](docs/CONTRACT.md) — the stable interface surface and its future amendments
 * [docs/ROADMAP.md](docs/ROADMAP.md) — phases and the gate for each
 * [docs/STATUS.md](docs/STATUS.md) — what is true today, and the ratified decisions
+* [docs/ORGANIZATION_AWARE_SETUP.md](docs/ORGANIZATION_AWARE_SETUP.md) — the Compute plane's part in Connect's organization-aware onboarding: shared-vs-personal compute, residency placement, ownership-vs-authorized-use (design direction)
 * [LICENSE](LICENSE) — Apache-2.0
