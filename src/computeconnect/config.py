@@ -21,6 +21,14 @@ Schema (all keys optional; unknown keys ignored)::
     include_sim_cloud: false     # append the simulated cloud provider too
     token: <bearer-token>        # require Authorization: Bearer <token> on all
                                  # routes but /health (env: COMPUTECONNECT_TOKEN)
+    bus_url: http://127.0.0.1:8790  # AgentConnect shared event bus (optional;
+                                 # env: COMPUTECONNECT_BUS_URL). Publishing is
+                                 # best-effort and never fatal (buspublish.py);
+                                 # both bus_url and bus_token are required to
+                                 # enable it.
+    bus_token: <publish-token>  # scoped to source_product=computeconnect via
+                                 # `agentconnect tokens publish --source-product
+                                 # computeconnect` (env: COMPUTECONNECT_BUS_TOKEN)
     providers:
       local-llamacpp:
         engine: llamacpp         # llamacpp | simulated_cloud
@@ -61,6 +69,17 @@ CONFIG_ENV = "COMPUTECONNECT_CONFIG"
 #: ``run_journal``.
 TOKEN_ENV = "COMPUTECONNECT_TOKEN"
 
+#: Environment variables for the optional shared-ecosystem event bus
+#: publisher (buspublish.py; docs/EVENT_BUS.md in the AgentConnect repo).
+#: Both required to enable publishing — either absent leaves the publisher a
+#: no-op, the same posture an absent ``COMPUTECONNECT_TOKEN`` leaves auth.
+#: Resolved in :func:`load_app_config` with the same precedence as
+#: ``TOKEN_ENV``: an explicit argument wins, then the env var, then unset. A
+#: config file's own ``bus_url``/``bus_token`` keys, if present, win over
+#: both — same precedence ``run_journal``/``token`` already use.
+BUS_URL_ENV = "COMPUTECONNECT_BUS_URL"
+BUS_TOKEN_ENV = "COMPUTECONNECT_BUS_TOKEN"
+
 _DEFAULT_CAPS = ("completion", "chat", "generate")
 
 
@@ -96,6 +115,8 @@ def app_config_from_dict(
     snapshot_ttl: float = 5.0,
     run_journal_path: str | None = None,
     token: str | None = None,
+    bus_url: str | None = None,
+    bus_token: str | None = None,
 ) -> AppConfig:
     """Build an :class:`AppConfig` from a parsed config mapping.
 
@@ -129,6 +150,8 @@ def app_config_from_dict(
         if "max_snapshot_age" in raw:
             base.max_snapshot_age = raw.get("max_snapshot_age")
         base.token = raw.get("token") or token
+        base.bus_url = raw.get("bus_url") or bus_url
+        base.bus_token = raw.get("bus_token") or bus_token
         return base
 
     return AppConfig(
@@ -137,6 +160,8 @@ def app_config_from_dict(
         max_snapshot_age=raw.get("max_snapshot_age"),
         run_journal_path=raw.get("run_journal") or run_journal_path,
         token=raw.get("token") or token,
+        bus_url=raw.get("bus_url") or bus_url,
+        bus_token=raw.get("bus_token") or bus_token,
     )
 
 
@@ -164,6 +189,8 @@ def load_app_config(
     snapshot_ttl: float = 5.0,
     run_journal_path: str | None = None,
     token: str | None = None,
+    bus_url: str | None = None,
+    bus_token: str | None = None,
 ) -> AppConfig:
     """Load config from ``path`` (or ``$COMPUTECONNECT_CONFIG``), or fall back
     to the built-in default fleet when neither is set.
@@ -172,8 +199,15 @@ def load_app_config(
     otherwise ``$COMPUTECONNECT_TOKEN`` is used; otherwise the app stays open,
     matching the historical loopback-only behavior. A config file's own
     ``token`` key wins over both — see :func:`app_config_from_dict`.
+
+    ``bus_url``/``bus_token``: same precedence, against ``$COMPUTECONNECT_
+    BUS_URL``/``$COMPUTECONNECT_BUS_TOKEN``. Either left unset leaves the
+    event-bus publisher a no-op (buspublish.py) — publishing is optional and
+    never required for the service to run.
     """
     token = token if token is not None else os.environ.get(TOKEN_ENV)
+    bus_url = bus_url if bus_url is not None else os.environ.get(BUS_URL_ENV)
+    bus_token = bus_token if bus_token is not None else os.environ.get(BUS_TOKEN_ENV)
     path = path or os.environ.get(CONFIG_ENV)
     if not path:
         config = build_default_config(
@@ -183,6 +217,8 @@ def load_app_config(
             run_journal_path=run_journal_path,
         )
         config.token = token
+        config.bus_url = bus_url
+        config.bus_token = bus_token
         return config
     return app_config_from_dict(
         _read_file(path),
@@ -191,4 +227,6 @@ def load_app_config(
         snapshot_ttl=snapshot_ttl,
         run_journal_path=run_journal_path,
         token=token,
+        bus_url=bus_url,
+        bus_token=bus_token,
     )

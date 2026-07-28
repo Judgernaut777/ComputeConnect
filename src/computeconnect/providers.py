@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from .buspublish import BusPublisher, truncate_reason
 from .engines import ModelInfo
 from .runs import RunRegistry
 
@@ -57,6 +58,22 @@ class _CacheEntry:
     #: OpenAI layer can answer 503 (known but temporarily unavailable) instead
     #: of 404 (never existed) for models whose provider is currently down.
     last_known_models: tuple[ModelInfo, ...] = ()
+    #: One of "healthy" | "degraded" | "offline", or ``None`` before the
+    #: first-ever probe. Tracked separately from ``healthy`` (a plain bool)
+    #: so the bus-emission edge-trigger below can tell "reached the engine
+    #: but it reported itself unhealthy" (degraded) apart from "could not
+    #: reach the engine at all" (offline) — see ``_refresh``.
+    classification: str | None = None
+
+
+#: Wire event type for each classification, per EVENT_BUS.md §4 (reserved
+#: for ComputeConnect: provider.offline / provider.degraded /
+#: provider.recovered).
+_HEALTH_EVENT_TYPE = {
+    "offline": "provider.offline",
+    "degraded": "provider.degraded",
+    "healthy": "provider.recovered",
+}
 
 
 class ProviderRegistry:
@@ -66,6 +83,7 @@ class ProviderRegistry:
         runs: RunRegistry,
         *,
         snapshot_ttl: float = 5.0,
+        bus: BusPublisher | None = None,
     ) -> None:
         ids = [p.id for p in providers]
         if len(set(ids)) != len(ids):
@@ -74,6 +92,9 @@ class ProviderRegistry:
         self._runs = runs
         self._ttl = snapshot_ttl
         self._cache: dict[str, _CacheEntry] = {p.id: _CacheEntry() for p in providers}
+        #: Defaults to a disabled (no-op) publisher — a caller that doesn't
+        #: pass one gets exactly today's behavior, no bus traffic at all.
+        self._bus = bus if bus is not None else BusPublisher()
 
     @property
     def providers(self) -> list[ProviderSpec]:
@@ -86,19 +107,57 @@ class ProviderRegistry:
         return None
 
     async def _refresh(self, spec: ProviderSpec, entry: _CacheEntry) -> None:
+        previous = entry.classification
         try:
             health = await spec.engine.health()
             status = str(health.get("status", "unknown"))
             if status in ("unreachable", "down", "error"):
                 entry.healthy, entry.detail, entry.models = False, f"engine {status}", ()
+                # Reached the engine and it reported its own unhealthy
+                # status — a softer signal than the except branch below,
+                # which never got a response at all.
+                entry.classification = "degraded"
             else:
                 models = await spec.engine.list_models()
                 entry.healthy, entry.detail = True, status
                 entry.models = tuple(models)
                 entry.last_known_models = entry.models
+                entry.classification = "healthy"
         except Exception as exc:  # an outage is a refusal, not an exception
             entry.healthy, entry.detail, entry.models = False, f"unreachable: {exc}", ()
+            entry.classification = "offline"
         entry.taken_at = time.time()
+        self._emit_health_transition(spec, entry, previous)
+
+    def _emit_health_transition(
+        self, spec: ProviderSpec, entry: _CacheEntry, previous: str | None
+    ) -> None:
+        """Edge-triggered: publishes only on an actual classification change,
+        never on a repeated probe that confirms the same state (EVENT_BUS.md
+        §4.3's edge-triggering precedent, applied per-provider here).
+
+        A first-ever probe that is already healthy establishes a silent
+        baseline — no ``provider.recovered`` spam at startup. A first-ever
+        probe that is already down/degraded fires immediately: an outage
+        that predates this process is real news, not something to hide
+        behind "no prior state to compare against".
+        """
+        current = entry.classification
+        if current == previous:
+            return
+        if previous is None and current == "healthy":
+            return
+        self._bus.publish(
+            _HEALTH_EVENT_TYPE[current],
+            actor="computeconnect-provider-registry",
+            privacy_tier="public",
+            entity_id=spec.id,
+            payload={
+                "provider_id": spec.id,
+                "placement_class": spec.placement_class,
+                "reason": truncate_reason(entry.detail),
+            },
+        )
 
     async def snapshot(self, *, max_age: float | None = None) -> tuple[ProviderSnapshot, ...]:
         """Cached view of all providers; refreshes entries older than the TTL."""

@@ -37,6 +37,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from . import __version__
+from .buspublish import BusPublisher, truncate_reason
 from .engines import LlamaCppEngine, ModelInfo, SimulatedCloudEngine
 from .placement import (
     CandidateSet,
@@ -179,6 +180,14 @@ class AppConfig:
     #: Read from ``$COMPUTECONNECT_TOKEN`` by :func:`config.load_app_config`;
     #: settable here directly by programmatic callers/tests.
     token: str | None = None
+    #: Optional shared-ecosystem event bus target (docs/EVENT_BUS.md in the
+    #: AgentConnect repo). Both required to enable publishing; either absent
+    #: leaves ``BusPublisher`` a no-op — publishing is best-effort and never
+    #: fatal (see buspublish.py). Read from ``$COMPUTECONNECT_BUS_URL`` /
+    #: ``$COMPUTECONNECT_BUS_TOKEN`` by :func:`config.load_app_config`;
+    #: settable here directly by programmatic callers/tests.
+    bus_url: str | None = None
+    bus_token: str | None = None
 
     def effective_max_snapshot_age(self) -> float | None:
         if self.max_snapshot_age is not None:
@@ -293,8 +302,9 @@ class ComputeConnectAPI:
             RunJournal(config.run_journal_path) if config.run_journal_path else None
         )
         self.runs = RunRegistry(journal=self.journal)
+        self.bus = BusPublisher(bus_url=config.bus_url, token=config.bus_token)
         self.registry = ProviderRegistry(
-            config.providers, self.runs, snapshot_ttl=config.snapshot_ttl
+            config.providers, self.runs, snapshot_ttl=config.snapshot_ttl, bus=self.bus
         )
         self._max_snapshot_age = config.effective_max_snapshot_age()
 
@@ -312,6 +322,75 @@ class ComputeConnectAPI:
             messages.append({"role": "system", "content": str(context)})
         messages.append({"role": "user", "content": str(body.get("prompt", ""))})
         return messages
+
+    # ---------------------------------------------------------- event bus
+    #
+    # Both emit points are best-effort and never fatal (BusPublisher.publish
+    # never raises and never awaits the network call — see buspublish.py).
+    # Payloads carry only ids, names, decisions, reasons (bounded via
+    # truncate_reason), counts, and the privacy tier — never a prompt,
+    # message, or generated token.
+
+    def _emit_generation_refused(
+        self, privacy: ResolvedPrivacy, refusal: PlacementRefusal
+    ) -> None:
+        self.bus.publish(
+            "compute.generation.refused",
+            outcome="denied",
+            actor="computeconnect",
+            privacy_tier=privacy.effective,
+            payload={
+                "reason": truncate_reason(refusal.code),
+                "privacy_tier": privacy.effective,
+            },
+        )
+
+    #: Run-registry terminal states -> bus envelope `outcome` vocabulary
+    #: (EVENT_BUS.md §1: succeeded | failed | cancelled | denied | timed_out
+    #: | unknown | null). "disconnected" (the client went away mid-stream) is
+    #: a client-initiated cancellation from the bus's point of view.
+    _RUN_STATE_TO_OUTCOME = {
+        "succeeded": "succeeded",
+        "failed": "failed",
+        "cancelled": "cancelled",
+        "disconnected": "cancelled",
+    }
+
+    def _emit_generation_placed(
+        self,
+        run: Run,
+        placement: Placement,
+        privacy: ResolvedPrivacy,
+        *,
+        status: str,
+        duration_seconds: float,
+        reason: str | None = None,
+        usage: dict | None = None,
+        output_chars: int | None = None,
+    ) -> None:
+        payload: dict = {
+            "provider_id": placement.provider.spec.id,
+            "placement_class": placement.provider.spec.placement_class,
+            "selected_model": placement.model.id,
+            "privacy_tier": privacy.effective,
+            "elapsed_seconds": duration_seconds,
+        }
+        if usage:
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                if key in usage:
+                    payload[key] = usage[key]
+        elif output_chars is not None:
+            payload["output_chars"] = output_chars
+        if reason:
+            payload["reason"] = truncate_reason(reason)
+        self.bus.publish(
+            "compute.generation.placed",
+            outcome=self._RUN_STATE_TO_OUTCOME.get(status, "unknown"),
+            actor="computeconnect",
+            privacy_tier=privacy.effective,
+            entity_id=run.id,
+            payload=payload,
+        )
 
     # ------------------------------------------------------- Layer 1: control
 
@@ -437,6 +516,7 @@ class ComputeConnectAPI:
             candidates, workload, max_snapshot_age=self._max_snapshot_age
         )
         if isinstance(outcome, PlacementRefusal):
+            self._emit_generation_refused(privacy, outcome)
             return JSONResponse(
                 {
                     "run_id": None,
@@ -453,14 +533,16 @@ class ComputeConnectAPI:
         run = self.runs.create(
             provider_id=outcome.provider.spec.id, model=outcome.model.id, surface="generate"
         )
-        stream = self._generate_stream(run, outcome, body)
+        stream = self._generate_stream(run, outcome, body, privacy)
         return StreamingResponse(
             stream,
             media_type="application/json",
             headers={"X-Run-Id": run.id},
         )
 
-    async def _generate_stream(self, run: Run, placement: Placement, body: dict):
+    async def _generate_stream(
+        self, run: Run, placement: Placement, body: dict, privacy: ResolvedPrivacy
+    ):
         """Emit one JSON document incrementally; final status decided at the end."""
         engine = placement.provider.spec.engine
         model = placement.model
@@ -540,12 +622,27 @@ class ComputeConnectAPI:
                 persisted_chars = len(
                     _REASONING_TRUNCATED_MARKER + "\n\n" + _reasoning_text
                 )
+            duration_seconds = round(time.time() - started, 4)
             self.runs.finish(
                 run,
                 status,
                 chunks=chunks,
                 output_chars=persisted_chars,
-                duration_seconds=round(time.time() - started, 4),
+                duration_seconds=duration_seconds,
+            )
+            # Same terminal point as runs.finish() above -- this ``finally``
+            # runs on every exit path (succeeded, cancelled, failed, and a
+            # client disconnect that re-raises past it), so exactly one
+            # compute.generation.placed fires per run regardless of how it
+            # ended.
+            self._emit_generation_placed(
+                run,
+                placement,
+                privacy,
+                status=status,
+                duration_seconds=duration_seconds,
+                reason=(warnings[-1] if warnings and status != "succeeded" else None),
+                output_chars=persisted_chars,
             )
 
         reasoning_text = reasoning.get("text", "")
@@ -653,6 +750,7 @@ class ComputeConnectAPI:
             max_snapshot_age=self._max_snapshot_age,
         )
         if isinstance(outcome, PlacementRefusal):
+            self._emit_generation_refused(privacy, outcome)
             known_anywhere = any(
                 model_name == m.id for s in await self.registry.snapshot() for m in s.models
             )
@@ -720,13 +818,14 @@ class ComputeConnectAPI:
 
         if body.get("stream"):
             return StreamingResponse(
-                self._openai_sse(run, outcome, upstream),
+                self._openai_sse(run, outcome, upstream, privacy, real_usage),
                 media_type="text/event-stream",
                 headers={"X-Run-Id": run.id, "Cache-Control": "no-cache"},
             )
 
         # Non-streaming: assembling a complete JSON body necessarily collects
         # the output. The generation path is still the single streaming one.
+        started = time.time()
         upstream.start()
         parts: list[str] = []
         status = "succeeded"
@@ -741,6 +840,14 @@ class ComputeConnectAPI:
                 parts.append(item)
         except Exception as exc:
             self.runs.finish(run, "failed", error=str(exc))
+            self._emit_generation_placed(
+                run,
+                outcome,
+                privacy,
+                status="failed",
+                duration_seconds=round(time.time() - started, 4),
+                reason=str(exc),
+            )
             return self._openai_error(f"upstream engine error: {exc}", "upstream_error", 502)
         finally:
             await upstream.aclose()
@@ -758,6 +865,19 @@ class ComputeConnectAPI:
             prompt_tokens = sum(len(str(m.get("content", ""))) // 4 for m in messages)
             completion_tokens = max(1, len(text) // 4)
             total_tokens = prompt_tokens + completion_tokens
+
+        self._emit_generation_placed(
+            run,
+            outcome,
+            privacy,
+            status=status,
+            duration_seconds=round(time.time() - started, 4),
+            usage={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            },
+        )
 
         reasoning_text = reasoning.get("text", "")
         content = text
@@ -802,7 +922,14 @@ class ComputeConnectAPI:
             headers={"X-Run-Id": run.id},
         )
 
-    async def _openai_sse(self, run: Run, placement: Placement, upstream: "UpstreamStream"):
+    async def _openai_sse(
+        self,
+        run: Run,
+        placement: Placement,
+        upstream: "UpstreamStream",
+        privacy: ResolvedPrivacy,
+        real_usage: dict,
+    ):
         created = int(time.time())
         model_id = placement.model.id
         status = "succeeded"
@@ -838,6 +965,14 @@ class ComputeConnectAPI:
         finally:
             await upstream.aclose()
             self.runs.finish(run, status, chunks=n)
+            self._emit_generation_placed(
+                run,
+                placement,
+                privacy,
+                status=status,
+                duration_seconds=round(time.time() - created, 4),
+                usage=real_usage or None,
+            )
         finish = {"succeeded": "stop", "cancelled": "cancelled", "failed": "error"}[status]
         yield chunk({}, finish)
         yield "data: [DONE]\n\n"
