@@ -71,8 +71,9 @@ rather than inventing a new one.
 ## Standalone by design
 
 **ComputeConnect can be used on its own.** It depends on no sibling project. AgentConnect uses it
-for orchestration, BrainConnect uses it for inference, and any other application may use it
-directly:
+for orchestration and BrainConnect's librarian routes inference *through* it (ComputeConnect
+proxies to an external engine — it never performs or owns the inference itself; see
+[docs/COMPUTE_PLANE.md](docs/COMPUTE_PLANE.md)). Any other application may use it directly:
 
 * Applications and AgentConnect drive the **control-plane API** (`LocalComputeProvider`) — placement,
   admission, health, cancellation.
@@ -125,6 +126,7 @@ single-node systems — LocalAI, llama-swap, Ollama, LiteLLM — over building C
 
 ## Documents
 
+* [docs/COMPUTE_PLANE.md](docs/COMPUTE_PLANE.md) — the Compute plane's ecosystem responsibilities: owned/rented/external/marketplace provider distinctions, why Connect never owns or resells the compute, and where cost and budgets live
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — boundaries, objects, prior art, the two APIs, the privacy invariant, integration contracts
 * [docs/CONTRACT.md](docs/CONTRACT.md) — the stable interface surface and its future amendments
 * [docs/ROADMAP.md](docs/ROADMAP.md) — phases and the gate for each
