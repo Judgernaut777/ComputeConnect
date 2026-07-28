@@ -57,6 +57,12 @@ class FakeLlamaUpstream:
         #: ``text/plain`` content type instead of the default JSON body —
         #: simulating a proxy (e.g. llama-swap) that doesn't speak JSON here.
         self.health_plain_text: str | None = None
+        #: The JSON body's ``"status"`` field on a 200 /health response (a
+        #: 200 with a non-"ok" status, e.g. "down"/"error"/"unreachable", is
+        #: how ComputeConnect's ProviderRegistry distinguishes "reached the
+        #: engine but it reports itself unhealthy" from "couldn't reach it at
+        #: all" — see providers.py's classification "degraded" vs "offline").
+        self.health_body_status = "ok"
         #: When set, the final SSE chunk before ``[DONE]`` carries this dict
         #: as ``"usage"`` (with empty ``choices``), the way a real
         #: OpenAI-compatible server answers when the request set
@@ -98,7 +104,9 @@ class FakeLlamaUpstream:
             if self.health_plain_text is not None:
                 await self._text(send, self.health_plain_text, status=self.health_status)
             else:
-                await self._json(send, {"status": "ok"}, status=self.health_status)
+                await self._json(
+                    send, {"status": self.health_body_status}, status=self.health_status
+                )
         elif method == "GET" and path == "/v1/models":
             self.models_requests += 1
             await self._json(
